@@ -1,0 +1,27 @@
+package main
+
+// Prepare a 2-qubit Bell state: (|00> + |11>) / sqrt(2)
+func PrepareBellPair(a: qubit, b: qubit) unitary {
+    H(a)
+    CX(a, b)
+}
+
+func TestBellPair() {
+    q0 := qalloc()
+    q1 := qalloc()
+    PrepareBellPair(q0, q1)
+
+    m0 := measure(q0)
+    m1 := measure(q1)
+    // In a Bell pair, both qubits always collapse to the same bit.
+    assert_eq(m0, m1)
+}
+
+func main() {
+    q0 := qalloc()
+    q1 := qalloc()
+    PrepareBellPair(q0, q1)
+    m0 := measure(q0)
+    m1 := measure(q1)
+    println("Measured Bell pair:", m0, m1)
+}

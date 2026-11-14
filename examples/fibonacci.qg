@@ -1,0 +1,38 @@
+package main
+
+// Iterative Fibonacci: returns the n-th Fibonacci number (0-indexed).
+func fibIter(n: int) -> int {
+    if n <= 1 {
+        return n
+    }
+    a := 0
+    b := 1
+    for i := 2; i <= n; i = i + 1 {
+        next := a + b
+        a = b
+        b = next
+    }
+    return b
+}
+
+// Recursive Fibonacci: returns the n-th Fibonacci number (0-indexed).
+func fibRec(n: int) -> int {
+    if n <= 1 {
+        return n
+    }
+    return fibRec(n - 1) + fibRec(n - 2)
+}
+
+func TestFibonacci() {
+    assert_eq(fibIter(0), 0)
+    assert_eq(fibIter(1), 1)
+    assert_eq(fibIter(10), 55)
+    assert_eq(fibRec(10), 55)
+}
+
+func main() {
+    println("Fibonacci (0..10):")
+    for i := 0; i <= 10; i = i + 1 {
+        println("fib(" + int_to_str(i) + ") =", fibIter(i))
+    }
+}
