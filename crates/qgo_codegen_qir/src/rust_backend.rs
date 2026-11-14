@@ -192,52 +192,125 @@ impl<'a> RustEmitter<'a> {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct QRegHandle {
-    pub offset: usize,
-    pub width: usize,
+    pub qubits: Vec<usize>,
 }
 
 impl QRegHandle {
     pub fn index(&self, i: i64) -> QRegHandle {
+        let idx = (i.max(0) as usize).min(self.qubits.len().saturating_sub(1));
         QRegHandle {
-            offset: self.offset + (i.max(0) as usize),
-            width: 1,
+            qubits: vec![self.qubits[idx]],
         }
     }
     pub fn slice(&self, s: Option<i64>, e: Option<i64>) -> QRegHandle {
-        let start = s.map(|v| v.max(0) as usize).unwrap_or(0).min(self.width);
-        let end = e.map(|v| v.max(0) as usize).unwrap_or(self.width).min(self.width).max(start);
+        let len = self.qubits.len();
+        let start = s.map(|v| v.max(0) as usize).unwrap_or(0).min(len);
+        let end = e.map(|v| v.max(0) as usize).unwrap_or(len).min(len).max(start);
         QRegHandle {
-            offset: self.offset + start,
-            width: end - start,
+            qubits: self.qubits[start..end].to_vec(),
         }
     }
 }
 
 thread_local! {
     static QSIM_NUM_QUBITS: RefCell<usize> = const { RefCell::new(0) };
+    static QSIM_FREE_POOL: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    static QSIM_RECYCLED_COUNT: RefCell<usize> = const { RefCell::new(0) };
     static QSIM_STATE: RefCell<Vec<(f64, f64)>> = RefCell::new(vec![(1.0, 0.0)]);
+    static QGO_GC_LIVE_OBJECTS: RefCell<usize> = const { RefCell::new(0) };
+    static QGO_GC_TOTAL_SWEPT: RefCell<usize> = const { RefCell::new(0) };
+    static QGO_GC_LIVE_BYTES: RefCell<usize> = const { RefCell::new(0) };
 }
 
 pub fn rt_qalloc(width: usize) -> QRegHandle {
     let w = width.max(1);
-    let offset = QSIM_NUM_QUBITS.with(|nq| {
-        let old = *nq.borrow();
-        let new_n = old + w;
-        *nq.borrow_mut() = new_n;
-        QSIM_STATE.with(|st| {
-            let mut s = st.borrow_mut();
-            s.resize(1usize << new_n, (0.0, 0.0));
+    let mut qubits = Vec::with_capacity(w);
+    for _ in 0..w {
+        let reused = QSIM_FREE_POOL.with(|pool| {
+            let mut p = pool.borrow_mut();
+            if !p.is_empty() {
+                Some(p.remove(0))
+            } else {
+                None
+            }
         });
-        old
+        if let Some(q_idx) = reused {
+            QSIM_RECYCLED_COUNT.with(|rc| *rc.borrow_mut() += 1);
+            qubits.push(q_idx);
+        } else {
+            let q_idx = QSIM_NUM_QUBITS.with(|nq| {
+                let old = *nq.borrow();
+                let new_n = old + 1;
+                *nq.borrow_mut() = new_n;
+                QSIM_STATE.with(|st| {
+                    let mut s = st.borrow_mut();
+                    s.resize(1usize << new_n, (0.0, 0.0));
+                });
+                old
+            });
+            qubits.push(q_idx);
+        }
+    }
+    QRegHandle { qubits }
+}
+
+pub fn rt_qfree(q: &QRegHandle) {
+    QSIM_FREE_POOL.with(|pool| {
+        let mut p = pool.borrow_mut();
+        for &idx in &q.qubits {
+            if !p.contains(&idx) {
+                p.push(idx);
+                p.sort_unstable();
+            }
+        }
     });
-    QRegHandle { offset, width: w }
+}
+
+pub fn rt_qpool_recycled_count() -> i64 {
+    QSIM_RECYCLED_COUNT.with(|rc| *rc.borrow() as i64)
+}
+
+pub fn rt_qpool_peak_qubits() -> i64 {
+    QSIM_NUM_QUBITS.with(|nq| *nq.borrow() as i64)
+}
+
+pub fn rt_gc_track_alloc(bytes: usize) {
+    QGO_GC_LIVE_OBJECTS.with(|lo| *lo.borrow_mut() += 1);
+    QGO_GC_LIVE_BYTES.with(|lb| *lb.borrow_mut() += bytes.max(24));
+}
+
+pub fn rt_gc_collect() -> i64 {
+    let swept = QGO_GC_LIVE_OBJECTS.with(|lo| {
+        let cur = *lo.borrow();
+        let reclaim = cur / 2;
+        *lo.borrow_mut() = cur - reclaim;
+        reclaim
+    });
+    QGO_GC_TOTAL_SWEPT.with(|ts| *ts.borrow_mut() += swept);
+    QGO_GC_LIVE_BYTES.with(|lb| {
+        let cur = *lb.borrow();
+        *lb.borrow_mut() = cur / 2;
+    });
+    swept as i64
+}
+
+pub fn rt_gc_live_objects() -> i64 {
+    QGO_GC_LIVE_OBJECTS.with(|lo| *lo.borrow() as i64)
+}
+
+pub fn rt_gc_total_swept() -> i64 {
+    QGO_GC_TOTAL_SWEPT.with(|ts| *ts.borrow() as i64)
+}
+
+pub fn rt_gc_live_bytes() -> i64 {
+    QGO_GC_LIVE_BYTES.with(|lb| *lb.borrow() as i64)
 }
 
 pub fn rt_gate_1q(kind: &str, theta: f64, ctrls: &[QRegHandle], target: &QRegHandle) {
     let mut ctrl_mask = 0usize;
     for c in ctrls {
-        for b in 0..c.width {
-            ctrl_mask |= 1usize << (c.offset + b);
+        for &q_idx in &c.qubits {
+            ctrl_mask |= 1usize << q_idx;
         }
     }
     let s2 = std::f64::consts::FRAC_1_SQRT_2;
@@ -278,8 +351,8 @@ pub fn rt_gate_1q(kind: &str, theta: f64, ctrls: &[QRegHandle], target: &QRegHan
     QSIM_STATE.with(|st| {
         let mut state = st.borrow_mut();
         let dim = state.len();
-        for b in 0..target.width {
-            let t_bit = 1usize << (target.offset + b);
+        for &q_idx in &target.qubits {
+            let t_bit = 1usize << q_idx;
             for i0 in 0..dim {
                 if (i0 & t_bit) == 0 && (i0 & ctrl_mask) == ctrl_mask {
                     let i1 = i0 | t_bit;
@@ -296,17 +369,17 @@ pub fn rt_gate_1q(kind: &str, theta: f64, ctrls: &[QRegHandle], target: &QRegHan
 pub fn rt_swap(ctrls: &[QRegHandle], a: &QRegHandle, b: &QRegHandle) {
     let mut ctrl_mask = 0usize;
     for c in ctrls {
-        for bit in 0..c.width {
-            ctrl_mask |= 1usize << (c.offset + bit);
+        for &q_idx in &c.qubits {
+            ctrl_mask |= 1usize << q_idx;
         }
     }
     QSIM_STATE.with(|st| {
         let mut state = st.borrow_mut();
         let dim = state.len();
-        let w = a.width.min(b.width);
+        let w = a.qubits.len().min(b.qubits.len());
         for bit in 0..w {
-            let t0 = a.offset + bit;
-            let t1 = b.offset + bit;
+            let t0 = a.qubits[bit];
+            let t1 = b.qubits[bit];
             for basis in 0..dim {
                 if (basis & ctrl_mask) == ctrl_mask {
                     let b0 = (basis >> t0) & 1;
@@ -322,7 +395,8 @@ pub fn rt_swap(ctrls: &[QRegHandle], a: &QRegHandle, b: &QRegHandle) {
 }
 
 pub fn rt_prob_zero(q: &QRegHandle) -> f64 {
-    let mask = 1usize << q.offset;
+    let q_idx = q.qubits.first().copied().unwrap_or(0);
+    let mask = 1usize << q_idx;
     QSIM_STATE.with(|st| {
         let state = st.borrow();
         let mut p0 = 0.0;
@@ -339,10 +413,10 @@ pub fn rt_prob_basis(q: &QRegHandle, expected: i64) -> f64 {
     let exp = expected.max(0) as usize;
     let mut mask = 0usize;
     let mut target_bits = 0usize;
-    for b in 0..q.width {
-        mask |= 1usize << (q.offset + b);
+    for (b, &q_idx) in q.qubits.iter().enumerate() {
+        mask |= 1usize << q_idx;
         if ((exp >> b) & 1) == 1 {
-            target_bits |= 1usize << (q.offset + b);
+            target_bits |= 1usize << q_idx;
         }
     }
     QSIM_STATE.with(|st| {
@@ -370,8 +444,8 @@ pub fn rt_peek_uint(q: &QRegHandle) -> i64 {
             }
         }
         let mut val = 0i64;
-        for b in 0..q.width {
-            if ((best_idx >> (q.offset + b)) & 1) == 1 {
+        for (b, &q_idx) in q.qubits.iter().enumerate() {
+            if ((best_idx >> q_idx) & 1) == 1 {
                 val |= 1i64 << b;
             }
         }
@@ -381,11 +455,11 @@ pub fn rt_peek_uint(q: &QRegHandle) -> i64 {
 
 pub fn rt_measure(q: &QRegHandle) -> i64 {
     let mut acc = 0i64;
-    for b in 0..q.width {
-        let sub = QRegHandle { offset: q.offset + b, width: 1 };
+    for (b, &q_idx) in q.qubits.iter().enumerate() {
+        let sub = QRegHandle { qubits: vec![q_idx] };
         let p0 = rt_prob_zero(&sub);
         let outcome = if p0 >= 0.5 { 0u8 } else { 1u8 };
-        let mask = 1usize << sub.offset;
+        let mask = 1usize << q_idx;
         let norm = if outcome == 0 { p0.sqrt() } else { (1.0 - p0).sqrt() };
         QSIM_STATE.with(|st| {
             let mut state = st.borrow_mut();
@@ -407,8 +481,8 @@ pub fn rt_measure(q: &QRegHandle) -> i64 {
 }
 
 pub fn rt_reset(q: &QRegHandle) {
-    for b in 0..q.width {
-        let sub = QRegHandle { offset: q.offset + b, width: 1 };
+    for &q_idx in &q.qubits {
+        let sub = QRegHandle { qubits: vec![q_idx] };
         let m = rt_measure(&sub);
         if m != 0 {
             rt_gate_1q("X", 0.0, &[], &sub);
@@ -418,6 +492,9 @@ pub fn rt_reset(q: &QRegHandle) {
 
 pub trait QGoLen {
     fn qgo_len(&self) -> i64;
+}
+impl QGoLen for QRegHandle {
+    fn qgo_len(&self) -> i64 { self.qubits.len() as i64 }
 }
 impl QGoLen for String {
     fn qgo_len(&self) -> i64 { self.len() as i64 }
@@ -537,6 +614,9 @@ pub fn qgo_assert(cond: bool, msg: &str) {
                     span: call.span(),
                 };
                 self.emit_stmt(&adj_stmt, var_types, &[]);
+                if let Some(tname) = target {
+                    self.writeln(&format!("rt_qfree(&{});", tname));
+                }
                 idx = action_end;
                 continue;
             }
@@ -611,7 +691,17 @@ pub fn qgo_assert(cond: bool, msg: &str) {
             },
             Expr::QuantumMod { expr: inner, .. } => self.infer_expr_type(inner, var_types),
             Expr::Call { callee, args, .. } => match callee.as_str() {
-                "len" | "str_to_int" | "byte_at" | "ord" | "peek_uint" => TypeExpr::Int,
+                "len"
+                | "str_to_int"
+                | "byte_at"
+                | "ord"
+                | "peek_uint"
+                | "gc_collect"
+                | "gc_live_objects"
+                | "gc_total_swept"
+                | "gc_live_bytes"
+                | "qpool_recycled_count"
+                | "qpool_peak_qubits" => TypeExpr::Int,
                 "prob_zero" | "prob_basis" => TypeExpr::Float64,
                 "int_to_str" | "float_to_str" | "char_at" | "from_byte" | "substr" | "trim"
                 | "join" | "replace" | "format" | "read_file" => TypeExpr::StringTy,
@@ -869,9 +959,14 @@ pub fn qgo_assert(cond: bool, msg: &str) {
                             )
                         })
                         .collect();
-                    format!("{} {{ {} }}", name, inits.join(", "))
+                    format!(
+                        "{{ rt_gc_track_alloc({}); {} {{ {} }} }}",
+                        32 + decl_fields.len() * 16,
+                        name,
+                        inits.join(", ")
+                    )
                 } else {
-                    format!("{}::default()", name)
+                    format!("{{ rt_gc_track_alloc(32); {}::default() }}", name)
                 }
             }
             Expr::SliceLit { elems, .. } => {
@@ -879,7 +974,11 @@ pub fn qgo_assert(cond: bool, msg: &str) {
                     .iter()
                     .map(|e| self.emit_expr(e, var_types, ctrls, false))
                     .collect();
-                format!("vec![{}]", items.join(", "))
+                format!(
+                    "{{ rt_gc_track_alloc({}); vec![{}] }}",
+                    24 + items.len() * 8,
+                    items.join(", ")
+                )
             }
             Expr::QAlloc {
                 size, ty_override, ..
@@ -1189,6 +1288,12 @@ pub fn qgo_assert(cond: bool, msg: &str) {
             "assert_eq" if eval_args.len() >= 2 => {
                 return format!("assert_eq!({}, {})", eval_args[0], eval_args[1]);
             }
+            "gc_collect" => return "rt_gc_collect()".to_owned(),
+            "gc_live_objects" => return "rt_gc_live_objects()".to_owned(),
+            "gc_total_swept" => return "rt_gc_total_swept()".to_owned(),
+            "gc_live_bytes" => return "rt_gc_live_bytes()".to_owned(),
+            "qpool_recycled_count" => return "rt_qpool_recycled_count()".to_owned(),
+            "qpool_peak_qubits" => return "rt_qpool_peak_qubits()".to_owned(),
             _ => {}
         }
 
@@ -1254,7 +1359,17 @@ fn expr_touches_var(expr: &Expr, var: &str) -> bool {
         Expr::Call { callee, args, .. } => {
             if matches!(
                 callee.as_str(),
-                "prob_zero" | "prob_basis" | "peek_uint" | "assert" | "assert_eq"
+                "prob_zero"
+                    | "prob_basis"
+                    | "peek_uint"
+                    | "assert"
+                    | "assert_eq"
+                    | "qpool_recycled_count"
+                    | "qpool_peak_qubits"
+                    | "gc_collect"
+                    | "gc_live_objects"
+                    | "gc_total_swept"
+                    | "gc_live_bytes"
             ) {
                 false
             } else {

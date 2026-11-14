@@ -429,6 +429,12 @@ fn builtin_gate_signatures() -> HashMap<String, FuncSig> {
         ("prob_zero", Ty::Float64),
         ("prob_basis", Ty::Float64),
         ("peek_uint", Ty::Int),
+        ("gc_collect", Ty::Int),
+        ("gc_live_objects", Ty::Int),
+        ("gc_total_swept", Ty::Int),
+        ("gc_live_bytes", Ty::Int),
+        ("qpool_recycled_count", Ty::Int),
+        ("qpool_peak_qubits", Ty::Int),
         ("exit", Ty::Void),
     ] {
         m.insert(

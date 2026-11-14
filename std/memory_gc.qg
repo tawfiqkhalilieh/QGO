@@ -1,0 +1,115 @@
+// std/memory_gc.qg
+// Physical Qubit Pool / Ancilla Recycling Allocator &
+// Classical Runtime Tri-Color Mark-and-Sweep Garbage Collector Benchmark
+
+package main
+
+struct HeapPacket {
+    id: int
+    tag: string
+    weights: []int
+}
+
+// Stage 1 reversible parity oracle: anc ^= data[0] ^ data[1]
+func ParityOracle01(data: qreg[4], anc: qubit) qfree {
+    CX(data[0], anc)
+    CX(data[1], anc)
+}
+
+// Stage 2 reversible Toffoli oracle: anc ^= (data[1] & data[2])
+func AndOracle12(data: qreg[4], anc: qubit) qfree {
+    CCX(data[1], data[2], anc)
+}
+
+// Stage 3 reversible parity oracle: anc ^= data[2] ^ data[3]
+func ParityOracle23(data: qreg[4], anc: qubit) qfree {
+    CX(data[2], anc)
+    CX(data[3], anc)
+}
+
+// 3-Stage Quantum Pipeline demonstrating Physical Qubit Pool / Ancilla Recycling:
+// Operates on 4 data qubits + 3 sequential ancilla qubits (`anc1`, `anc2`, `anc3`).
+// Because each ancilla is uncomputed to |0> via `defer adj ... -> ancK` before the next
+// stage begins, the compiler's Pass 4.5 (`recycle_ancillas`) and the runtime Physical
+// Qubit Pool recycle the single physical ancilla wire across all 3 stages:
+//   - Peak Physical Qubits: 5 (4 data + 1 pooled ancilla, 2^5 = 32 amplitudes)
+//   - Unpooled Naive Qubits: 7 (4 data + 3 ancillas, 2^7 = 128 amplitudes -> 4x memory saved)
+//   - Recycled Ancilla Allocations: 2
+func MultiStageAncillaPipeline(data: qreg[4]) unitary {
+    X(data[0])
+    H(data[1])
+    X(data[2])
+
+    // Stage 1: Allocate anc1, compute parity(data[0], data[1]), kick phase, uncompute & free anc1
+    anc1 := qalloc()
+    ParityOracle01(data, anc1)
+    defer adj ParityOracle01(data, anc1) -> anc1
+    ctrl(anc1) Z(data[2])
+
+    // Stage 2: Allocate anc2 (recycles physical wire freed by anc1!), Toffoli kick, uncompute & free anc2
+    anc2 := qalloc()
+    AndOracle12(data, anc2)
+    defer adj AndOracle12(data, anc2) -> anc2
+    ctrl(anc2) X(data[3])
+
+    // Stage 3: Allocate anc3 (recycles physical wire freed by anc2!), phase kick, uncompute & free anc3
+    anc3 := qalloc()
+    ParityOracle23(data, anc3)
+    defer adj ParityOracle23(data, anc3) -> anc3
+    ctrl(anc3) S(data[0])
+}
+
+// Helper that allocates ephemeral heap structs and slices that become unreachable upon return
+func AllocateEphemeralBatch(count: int) -> int {
+    total := 0
+    for i := 0; i < count; i = i + 1 {
+        pkt := HeapPacket{
+            id: i,
+            tag: "ephemeral_quantum_job_" + int_to_str(i),
+            weights: []int{i, i * 2, i * 3, i * 4},
+        }
+        total = total + pkt.weights[1]
+    }
+    return total
+}
+
+func TestQuantumPoolAndClassicalGC() {
+    // 1. Verify Physical Qubit Pool / Ancilla Recycling across 3 sequential oracle stages
+    reg := qalloc[4]()
+    MultiStageAncillaPipeline(reg)
+
+    // All 3 ancilla stages must share 1 physical ancilla qubit:
+    // Peak qubits = 5 (4 data + 1 pooled ancilla), Recycled count = 2 (anc2 and anc3 reused anc1's wire)
+    assert_eq(qpool_peak_qubits(), 5)
+    assert_eq(qpool_recycled_count(), 2)
+
+    // Verify quantum state invariants: data[0] = |1>, data[2] = |1>
+    assert(prob_zero(reg[0]) < 0.0001, "data[0] must remain in |1>")
+    assert(prob_zero(reg[2]) < 0.0001, "data[2] must remain in |1>")
+
+    // 2. Verify Classical Runtime Tri-Color Mark-and-Sweep Garbage Collector
+    root_pkt := HeapPacket{
+        id: 42,
+        tag: "persistent_root_circuit",
+        weights: []int{10, 20, 30},
+    }
+
+    checksum := AllocateEphemeralBatch(6)
+    assert_eq(checksum, 30)
+
+    live_before := gc_live_objects()
+    bytes_before := gc_live_bytes()
+    assert(live_before >= 2, "heap should hold live root + unreachable ephemeral objects before GC")
+    assert(bytes_before > 0, "heap live bytes should be positive before GC")
+
+    // Trigger explicit Tri-Color Mark-and-Sweep collection
+    swept := gc_collect()
+    assert(swept > 0, "Tri-Color Mark-and-Sweep GC must reclaim unreachable ephemeral objects")
+    assert(gc_total_swept() >= swept, "cumulative swept counter must record reclaimed objects")
+
+    // Verify reachable root object `root_pkt` survived collection intact
+    assert_eq(root_pkt.id, 42)
+    assert_eq(root_pkt.tag, "persistent_root_circuit")
+    assert_eq(len(root_pkt.weights), 3)
+    assert_eq(root_pkt.weights[2], 30)
+}

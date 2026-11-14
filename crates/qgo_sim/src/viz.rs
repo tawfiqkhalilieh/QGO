@@ -62,6 +62,8 @@ pub struct MemorySnapshot {
     pub basis_probs: Vec<f64>,
     /// Dominant complex phase $\arg(\alpha_x) \in (-\pi, \pi]$ for each basis state.
     pub basis_phases: Vec<f64>,
+    /// Cumulative number of ancilla allocations recycled from the $|0\rangle$ physical qubit pool.
+    pub recycled_qubits: usize,
 }
 
 /// Full execution trace of a quantum function for visualization.
@@ -217,6 +219,7 @@ fn trace_stmts_recursive(
                 let mut targets = Vec::new();
                 for b in 0..(*size).max(1) {
                     let w = QubitWire::new(reg.clone(), b);
+                    sim.release_wire(&w);
                     if let Some(entry) = ordered_wires.iter_mut().find(|(ew, _, _)| *ew == w) {
                         entry.2 = true;
                     }
@@ -226,7 +229,7 @@ fn trace_stmts_recursive(
                     sim,
                     ordered_wires,
                     data_wires,
-                    format!("qfree {}[0..{}] (Verified |0>)", reg, size),
+                    format!("qfree {}[0..{}] (Verified |0> -> Pool)", reg, size),
                     ConjStage::VerifiedFree(reg.clone()),
                     &[],
                     &targets,
@@ -440,6 +443,7 @@ fn capture_snapshot(
         data_wires: chart_wires,
         basis_probs,
         basis_phases,
+        recycled_qubits: sim.recycled_qubit_count,
     }
 }
 
@@ -898,8 +902,8 @@ fn render_snapshot_frame(
     let entangled_q = snap.wires.iter().filter(|w| w.purity < 0.98).count();
 
     let telemetry = format!(
-        "MEMORY TELEMETRY: QUBITS={}  ANCILLAS={}  DIRTY_ANCILLAS={}  ENTANGLED_WIRES={}  NO-CLONING=OK",
-        total_q, anc_q, dirty_anc, entangled_q
+        "TELEMETRY: QUBITS={}  ANCILLAS={}  DIRTY={}  POOL_RECYCLED={}  ENTANGLED={}  NO-CLONING=OK",
+        total_q, anc_q, dirty_anc, snap.recycled_qubits, entangled_q
     );
     draw_text(&mut fb, bp_x + 14, bp_y + 8, &telemetry, COL_TEXT_BRIGHT, 1);
 

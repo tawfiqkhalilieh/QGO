@@ -1,6 +1,6 @@
 # QGo Standard Quantum Algorithms Guide (`std/`)
 
-QGo ships with a verified standard library of **12 canonical quantum algorithms** in [`std/`](../std/). Every algorithm compiles to **OpenQASM 3.0**, **LLVM QIR 1.0**, and **Quantinuum HUGR v1 JSON**, passes exact statevector and Clifford stabilizer verification (`P(|0>) = 1.0` on all ancillas within $10^{-12}$), and includes executable `Test*` assertions verified by `QGoVM`.
+QGo ships with a verified standard library of **13 canonical quantum algorithms & memory benchmarks** in [`std/`](../std/). Every algorithm compiles to **OpenQASM 3.0**, **LLVM QIR 1.0**, and **Quantinuum HUGR v1 JSON**, passes exact statevector and Clifford stabilizer verification (`P(|0>) = 1.0` on all ancillas within $10^{-12}$), and includes executable `Test*` assertions verified by `QGoVM`.
 
 ---
 
@@ -20,6 +20,7 @@ QGo ships with a verified standard library of **12 canonical quantum algorithms*
 | 10 | **3-Qubit Bit-Flip Quantum Error Correction** | [`std/qec.qg`](../std/qec.qg) | Syndrome extraction, Toffoli recovery, `defer adj` syndrome check | `TestQuantumErrorCorrection` |
 | 11 | **QAOA MaxCut ($K_3$) & VQE Ansatz** | [`std/vqe_qaoa.qg`](../std/vqe_qaoa.qg) | Ising $ZZ$ parity gadgets with `defer adj`, `Rx`/`Ry`/`Rz` layers | `TestQAOAAndVQE` |
 | 12 | **Coined Discrete-Time Quantum Walk** | [`std/quantum_walk.qg`](../std/quantum_walk.qg) | Controlled modular increment/decrement, `defer adj` carry ancilla | `TestQuantumWalk` |
+| 13 | **Physical Qubit Pool & Classical Mark-and-Sweep GC** | [`std/memory_gc.qg`](../std/memory_gc.qg) | 3-stage ancilla pool recycling (`qpool_recycled_count`), Tri-Color GC (`gc_collect`) | `TestQuantumPoolAndClassicalGC` |
 
 ---
 
@@ -173,3 +174,15 @@ Simulates a discrete-time coined quantum walk on the 8-node cycle graph $C_8$ (`
 ![Coined Quantum Walk Memory Evolution](./gifs/quantum_walk_memory.gif)
 
 - Starting at node $\vert 4\rangle = \vert 100_2\rangle$, after 3 steps of coherent ballistic interference the walker resides exclusively on odd-parity nodes $\{1, 3, 5, 7\}$ with total probability $1.0$, while the carry ancilla `carry[0]` is allocated, entangled, and uncomputed to $\vert 0\rangle$ six times across the circuit.
+
+---
+
+## 13. Physical Qubit Pool & Classical Mark-and-Sweep GC ([`std/memory_gc.qg`](../std/memory_gc.qg))
+
+Demonstrates both QGo's **Physical Qubit Pool / Ancilla Recycling Allocator** (`MultiStageAncillaPipeline`) and the **Classical Runtime Tri-Color Mark-and-Sweep Garbage Collector** (`TestQuantumPoolAndClassicalGC`):
+
+![Physical Qubit Pool & Ancilla Recycling Memory Evolution](./gifs/ancilla_pool_recycling_memory.gif)
+
+- **Quantum Ancilla Pool Recycling**: Across 3 sequential oracle stages (`ParityOracle01`, `AndOracle12`, `ParityOracle23`), `anc2` and `anc3` reuse the physical wire freed by `defer adj ... -> anc1` (`qpool_peak_qubits() == 5`, `qpool_recycled_count() == 2`), reducing the statevector dimension by $4\times$ ($2^5 = 32$ vs. $2^7 = 128$).
+- **Classical Tri-Color Tracing GC**: Allocates ephemeral `HeapPacket` structs and slices inside `AllocateEphemeralBatch`, retains a reachable root `root_pkt` in the outer stack frame, and invokes `gc_collect()` to verify that unreachable objects are swept while `root_pkt` survives intact.
+

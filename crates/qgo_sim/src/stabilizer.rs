@@ -18,6 +18,8 @@ pub struct StabilizerSim {
     pub wire_map: HashMap<QubitWire, usize>,
     pub classical_vars: HashMap<String, i64>,
     pub ancilla_wires: Vec<QubitWire>,
+    pub free_qubit_pool: Vec<usize>,
+    pub recycled_qubit_count: usize,
 }
 
 impl StabilizerSim {
@@ -30,21 +32,29 @@ impl StabilizerSim {
             wire_map: HashMap::new(),
             classical_vars: HashMap::new(),
             ancilla_wires: Vec::new(),
+            free_qubit_pool: Vec::new(),
+            recycled_qubit_count: 0,
         }
     }
 
-    /// Allocates a new qubit wire initialized to $|0\rangle$ in the symplectic tableau.
+    /// Allocates a new qubit wire initialized to $|0\rangle$ in the symplectic tableau,
+    /// recycling a released physical qubit index from `free_qubit_pool` when available.
     pub fn allocate_wire(&mut self, wire: QubitWire, is_ancilla: bool) -> usize {
         if let Some(&idx) = self.wire_map.get(&wire) {
             return idx;
+        }
+        if is_ancilla && !self.ancilla_wires.contains(&wire) {
+            self.ancilla_wires.push(wire.clone());
+        }
+        if let Some(recycled_idx) = self.free_qubit_pool.pop() {
+            self.wire_map.insert(wire, recycled_idx);
+            self.recycled_qubit_count += 1;
+            return recycled_idx;
         }
         let old_n = self.num_qubits;
         let new_n = old_n + 1;
         self.num_qubits = new_n;
         self.wire_map.insert(wire.clone(), old_n);
-        if is_ancilla {
-            self.ancilla_wires.push(wire);
-        }
 
         // Expand existing rows by 1 column (false)
         for row in &mut self.x {
@@ -150,12 +160,17 @@ impl StabilizerSim {
                     for b in 0..*size {
                         let w = QubitWire::new(reg.clone(), b);
                         let p0 = self.prob_zero(&w);
-                        debug_assert!(
+                        assert!(
                             (1.0 - p0).abs() < 1e-12,
                             "StabilizerSim: ancilla wire {} not uncomputed to |0>! P(0) = {}",
                             w,
                             p0
                         );
+                        if let Some(idx) = self.wire_map.remove(&w) {
+                            if !self.free_qubit_pool.contains(&idx) {
+                                self.free_qubit_pool.push(idx);
+                            }
+                        }
                     }
                 }
                 MirStmt::Gate {

@@ -96,7 +96,7 @@ fn emit_func_qir(func: &MirFunc, out: &mut String) {
             MirStmt::QFree { reg, size } => {
                 for b in 0..(*size).max(1) {
                     let w = QubitWire::new(reg.clone(), b);
-                    if let Some(ssa) = wire_ssa.get(&w) {
+                    if let Some(ssa) = wire_ssa.remove(&w) {
                         out.push_str(&format!(
                             "  call void @__quantum__rt__qubit_release(%Qubit* {})\n",
                             ssa

@@ -6,10 +6,12 @@ use std::collections::HashMap;
 use qgo_mir::{MirFunc, MirGateKind, MirStmt, QubitWire};
 use qgo_opt::flatten_conjugates;
 
+pub mod gc;
 pub mod stabilizer;
 pub mod viz;
 pub mod vm;
 
+pub use gc::{ClassicalHeapGC, GcColor, GcHandle, HeapObjKind, HeapSlot};
 pub use stabilizer::StabilizerSim;
 pub use viz::{
     render_trace_gif, trace_func_memory, ConjStage, MemorySnapshot, MemoryTrace, WireMemorySlot,
@@ -82,7 +84,7 @@ impl std::ops::Mul<f64> for Complex {
     }
 }
 
-/// Exact $2^N$-amplitude statevector simulator.
+/// Exact $2^N$-amplitude statevector simulator with a Physical Qubit Pool for ancilla recycling.
 #[derive(Debug, Clone)]
 pub struct StatevectorSim {
     pub num_qubits: usize,
@@ -90,6 +92,10 @@ pub struct StatevectorSim {
     pub wire_map: HashMap<QubitWire, usize>,
     pub classical_vars: HashMap<String, i64>,
     pub ancilla_wires: Vec<QubitWire>,
+    /// Free-list pool of physical qubit indices verified in $|0\rangle$ and ready for reuse.
+    pub free_qubit_pool: Vec<usize>,
+    /// Total number of qubit allocations satisfied by recycling a freed physical qubit.
+    pub recycled_qubit_count: usize,
 }
 
 impl StatevectorSim {
@@ -100,24 +106,56 @@ impl StatevectorSim {
             wire_map: HashMap::new(),
             classical_vars: HashMap::new(),
             ancilla_wires: Vec::new(),
+            free_qubit_pool: Vec::new(),
+            recycled_qubit_count: 0,
         }
     }
 
-    /// Allocates a new qubit wire initialized to $|0\rangle$, expanding the statevector tensor product.
+    /// Allocates a new qubit wire initialized to $|0\rangle$.
+    /// If a released $|0\rangle$ physical qubit is available in `free_qubit_pool`, recycles it
+    /// in $O(1)$ without expanding the $2^N$ statevector.
     pub fn allocate_wire(&mut self, wire: QubitWire, is_ancilla: bool) -> usize {
         if let Some(&idx) = self.wire_map.get(&wire) {
             return idx;
         }
+        if is_ancilla && !self.ancilla_wires.contains(&wire) {
+            self.ancilla_wires.push(wire.clone());
+        }
+        if let Some(recycled_idx) = self.free_qubit_pool.pop() {
+            self.wire_map.insert(wire, recycled_idx);
+            self.recycled_qubit_count += 1;
+            return recycled_idx;
+        }
         let idx = self.num_qubits;
         self.num_qubits += 1;
-        self.wire_map.insert(wire.clone(), idx);
-        if is_ancilla {
-            self.ancilla_wires.push(wire);
-        }
+        self.wire_map.insert(wire, idx);
         // Tensor product |psi> (x) |0>: new bit `idx` is 0 for existing amplitudes, 1 for upper half
         let old_len = self.state.len();
         self.state.resize(old_len * 2, Complex::ZERO);
         idx
+    }
+
+    /// Verifies that `wire` has been uncomputed to $|0\rangle$ within $10^{-12}$,
+    /// unbinds `wire` from `wire_map`, and returns its physical bit index to `free_qubit_pool`.
+    pub fn release_wire(&mut self, wire: &QubitWire) {
+        let p0 = self.prob_zero(wire);
+        assert!(
+            (1.0 - p0).abs() < 1e-12,
+            "Ancilla wire {} was not uncomputed to |0>! P(0) = {}",
+            wire,
+            p0
+        );
+        if let Some(idx) = self.wire_map.remove(wire) {
+            let mask = 1usize << idx;
+            for (basis, amp) in self.state.iter_mut().enumerate() {
+                if (basis & mask) != 0 {
+                    *amp = Complex::ZERO;
+                }
+            }
+            if !self.free_qubit_pool.contains(&idx) {
+                self.free_qubit_pool.push(idx);
+            }
+        }
     }
 
     /// Prepares a register in a classical unsigned integer basis state $|val\rangle$.
@@ -157,16 +195,10 @@ impl StatevectorSim {
                     }
                 }
                 MirStmt::QFree { reg, size } => {
-                    // Verify uncomputed ancilla is in state |0> within tolerance 1e-12
+                    // Verify uncomputed ancilla is in state |0> within tolerance 1e-12 and return to pool
                     for b in 0..*size {
                         let w = QubitWire::new(reg.clone(), b);
-                        let p0 = self.prob_zero(&w);
-                        debug_assert!(
-                            (1.0 - p0).abs() < 1e-12,
-                            "Ancilla wire {} was not uncomputed to |0>! P(0) = {}",
-                            w,
-                            p0
-                        );
+                        self.release_wire(&w);
                     }
                 }
                 MirStmt::Gate {

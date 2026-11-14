@@ -15,8 +15,8 @@ QGo combines the clean ergonomics of Go (`package`, `import`, `func`, `:=`, `def
 | Document | Description |
 | :--- | :--- |
 | [**Language Specification (`LANGUAGE_SPEC.md`)**](./LANGUAGE_SPEC.md) | Complete lexical rules, Automatic Semicolon Insertion (ASI), linear quantum types, purity modifiers (`qfree`, `unitary`), `defer adj`, `ctrl`/`adj` modifiers, quantum conditionals, built-ins, and formal EBNF grammar. |
-| [**Quantum Memory Model (`QUANTUM_MEMORY_MODEL.md`)**](./QUANTUM_MEMORY_MODEL.md) | Deep dive into QGo's linear quantum memory lifecycle, reduced density matrix purity $\text{Tr}(\rho_q^2)$, Bloch vector telemetry, `E0400`–`E0403` compile-time diagnostics, and animated GIF memory traces. |
-| [**Quantum Algorithms Guide (`ALGORITHMS_GUIDE.md`)**](./ALGORITHMS_GUIDE.md) | Mathematical foundations, QGo source walkthroughs, resource estimates, and animated quantum memory GIFs for all 12 standard library quantum algorithms in [`std/`](../std/). |
+| [**Quantum Memory Model (`QUANTUM_MEMORY_MODEL.md`)**](./QUANTUM_MEMORY_MODEL.md) | Deep dive into QGo's linear quantum memory lifecycle, Physical Qubit Pool / Ancilla Recycling Allocator, Classical Tri-Color Mark-and-Sweep GC, reduced density matrix purity $\text{Tr}(\rho_q^2)$, Bloch vector telemetry, `E0400`–`E0403` compile-time diagnostics, and animated GIF memory traces. |
+| [**Quantum Algorithms Guide (`ALGORITHMS_GUIDE.md`)**](./ALGORITHMS_GUIDE.md) | Mathematical foundations, QGo source walkthroughs, resource estimates, and animated quantum memory GIFs for all 13 standard library quantum algorithms & memory benchmarks in [`std/`](../std/). |
 | [**Compiler Architecture (`COMPILER_ARCHITECTURE.md`)**](./COMPILER_ARCHITECTURE.md) | Internals of the 11-crate Rust workspace, HIR/MIR lowering, optimization passes, OpenQASM 3.0 / QIR / HUGR / Rust AOT backends, simulators (`StatevectorSim`, `StabilizerSim`, `QGoVM`), and 3-stage self-hosting bootstrap verification. |
 
 ---
@@ -107,3 +107,7 @@ Every animated GIF below was generated directly by QGo's built-in quantum memory
 
 ### 10. Bernstein-Vazirani Secret String $s = 1101_2$ Recovery ([`std/bernstein_vazirani.qg`](../std/bernstein_vazirani.qg))
 ![Bernstein-Vazirani Memory Evolution](./gifs/bernstein_vazirani_memory.gif)
+
+### 11. 3-Stage Physical Qubit Pool & Ancilla Recycling ([`std/memory_gc.qg`](../std/memory_gc.qg))
+![Physical Qubit Pool & Ancilla Recycling Memory Evolution](./gifs/ancilla_pool_recycling_memory.gif)
+

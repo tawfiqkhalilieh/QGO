@@ -128,3 +128,70 @@ In [`std/quantum_walk.qg`](../std/quantum_walk.qg), each step of the quantum wal
 ![Coined Quantum Walk Memory Evolution](./gifs/quantum_walk_memory.gif)
 
 Because of QGo's **Pass 3.2 Control-Skip Theorem**, `ctrl(coin) IncrementCycle8(pos)` does **not** add the `coin` control wire to the `CCX(pos[0], pos[1], carry[0])` compute/uncompute gates—it controls only the inner action gates!
+
+---
+
+## 5. Physical Qubit Pool & Ancilla Recycling Allocator (`Pass 4.5` + Runtime Pool)
+
+In quantum computing, every additional unpooled ancilla qubit doubles the Hilbert space dimension ($2^n \to 2^{n+1}$). Once an ancilla register has been deterministically uncomputed back to $\vert 0\rangle$ via `defer adj ... -> anc` (returning its reduced purity to $\text{Tr}(\rho_{\text{anc}}^2) = 1.00$), its physical qubit wire is completely disentangled and ready for reuse.
+
+QGo implements **Physical Qubit Pool / Ancilla Recycling** at both compile time and runtime:
+
+1. **Compiler Pass 4.5 (`recycle_ancillas` in [`crates/qgo_opt/src/lib.rs`](../crates/qgo_opt/src/lib.rs))**:
+   - Performs live-range analysis across `MirStmt::QAlloc { is_ancilla: true }` and `MirStmt::QFree`.
+   - Maintains a free pool of uncomputed ancilla registers `(reg_name, size)` and rewrites subsequent `QAlloc` statements (along with all `Gate`, `Conjugate`, `Measure`, `Reset`, and `QFree` wire references) to reuse the freed physical register name and wires.
+   - Reports both **Peak Ancilla Qubits** (`ancilla_qubits`) and **Recycled Ancillas** (`recycled_ancillas`) in `qgo estimate`.
+2. **Runtime Physical Qubit Pool ([`crates/qgo_sim/src/lib.rs`](../crates/qgo_sim/src/lib.rs), [`crates/qgo_sim/src/vm.rs`](../crates/qgo_sim/src/vm.rs), [`crates/qgo_codegen_qir/src/rust_backend.rs`](../crates/qgo_codegen_qir/src/rust_backend.rs))**:
+   - `StatevectorSim`, `StabilizerSim`, `QGoVM`, and the Native Rust AOT runtime maintain a sorted `free_qubit_pool` of released physical indices.
+   - When `defer adj ... -> anc` finishes uncomputing `anc`, `release_wire` returns its physical index to `free_qubit_pool`.
+   - Subsequent `qalloc()` calls pop the lowest available index from `free_qubit_pool` and increment `recycled_qubit_count` instead of expanding the $2^n$ statevector!
+
+### 5.1 Visual Walkthrough: 3-Stage Ancilla Pool Recycling (`ancilla_pool_recycling_memory.gif`)
+In [`std/memory_gc.qg`](../std/memory_gc.qg), `MultiStageAncillaPipeline(data: qreg[4])` allocates three sequential oracle ancillas (`anc1`, `anc2`, `anc3`) across three distinct reversible stages (`ParityOracle01`, `AndOracle12`, `ParityOracle23`):
+
+![Physical Qubit Pool & Ancilla Recycling Memory Evolution](./gifs/ancilla_pool_recycling_memory.gif)
+
+Watch the wire cards and bottom telemetry bar (`POOL_RECYCLED=2`) in the animation above:
+- Instead of allocating 7 physical wires (`data[0..4]` + `anc1`, `anc2`, `anc3`, requiring $2^7 = 128$ complex amplitudes), QGo recycles the single physical ancilla wire `anc1[0]` across all three stages—keeping the peak Hilbert space at **5 physical qubits ($2^5 = 32$ amplitudes, a $4\times$ statevector memory reduction)** with `POOL_RECYCLED=2`!
+
+---
+
+## 6. Classical Runtime Tri-Color Mark-and-Sweep Garbage Collector (`ClassicalHeapGC`)
+
+While quantum registers obey strict linear ownership and deterministic `defer adj` uncomputation, classical heap objects in QGo (`string`, dynamic slices `[]T`, and heap-allocated structs `struct { ... }`) can form arbitrary shared and cyclic reference graphs across hybrid quantum-classical loops.
+
+QGo includes a deterministic **Tri-Color Tracing Mark-and-Sweep Garbage Collector** in [`crates/qgo_sim/src/gc.rs`](../crates/qgo_sim/src/gc.rs), integrated with both `QGoVM` ([`crates/qgo_sim/src/vm.rs`](../crates/qgo_sim/src/vm.rs)) and the Native Rust AOT runtime ([`crates/qgo_codegen_qir/src/rust_backend.rs`](../crates/qgo_codegen_qir/src/rust_backend.rs)):
+
+```mermaid
+stateDiagram-v2
+    [*] --> White : Heap Allocation (Slice / Struct / String)
+    White --> Gray : Root-Set Discovery (Call Stack + Lexical Scopes)
+    Gray --> Black : Trace Child References (Fields & Slice Elements)
+    White --> Gray : Write Barrier on Mutated Black Container
+    White --> Swept : Sweep Phase (Unreachable White Slot Reclaimed)
+    Swept --> FreeList : Arena Slot Recycled for Next Allocation
+    Black --> White : Reset Color for Next GC Cycle
+```
+
+### 6.1 GC Architecture & Write Barriers
+1. **Tri-Color Invariant (`White`, `Gray`, `Black`)**:
+   - **White (`GcColor::White`)**: Unvisited candidate for reclamation.
+   - **Gray (`GcColor::Gray`)**: Reachable from the root set (`call_frame_stack` + active lexical frame), queued on the grey worklist so its child `GcHandle` edges (`HeapObjKind::Slice` elements and `HeapObjKind::Struct` fields) are traced.
+   - **Black (`GcColor::Black`)**: Reachable and all outgoing child references have been scanned; retains no direct pointers to `White` objects.
+2. **Dijkstra-Style Write Barrier**:
+   - Mutating a field (`s.field = val`) or slice element (`arr[i] = val`) on an already-marked `Black` object with a reference to a `White` child shades the child `Gray`, preserving the strong tri-color invariant during incremental mutations.
+3. **Arena Slot Recycling (`free_slots`)**:
+   - During `sweep()`, every remaining `White` object is dropped, `live_objects` and `live_bytes` are decremented, `total_swept_objects` is incremented, and the freed arena index is pushed to `free_slots` for $O(1)$ reuse.
+
+### 6.2 Memory & GC Runtime Intrinsics
+QGo exposes six built-in runtime intrinsics for inspecting and controlling both the Quantum Physical Qubit Pool and the Classical Heap GC (see [`std/memory_gc.qg`](../std/memory_gc.qg)):
+
+| Built-in Intrinsic | Return Type | Description |
+| :--- | :--- | :--- |
+| `qpool_peak_qubits()` | `int` | Peak physical qubits allocated in the quantum statevector/stabilizer runtime. |
+| `qpool_recycled_count()` | `int` | Cumulative number of `qalloc` requests satisfied by recycling a freed $\vert 0\rangle$ ancilla wire. |
+| `gc_collect()` | `int` | Runs a full Tri-Color Mark-and-Sweep collection from all active stack frames and returns the number of swept objects. |
+| `gc_live_objects()` | `int` | Current number of live heap objects (`Slice`, `Struct`, child `Str`) in the GC arena. |
+| `gc_total_swept()` | `int` | Cumulative number of unreachable heap objects reclaimed across all GC cycles. |
+| `gc_live_bytes()` | `int` | Estimated bytes occupied by currently live classical heap objects. |
+

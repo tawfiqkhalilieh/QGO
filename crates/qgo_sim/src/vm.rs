@@ -14,18 +14,19 @@ use qgo_syntax::{
     BinOp, Block, ConstExpr, Expr, FuncDecl, ModKind, SourceFile, Stmt, TopLevelDecl, TypeExpr,
     UnOp,
 };
+use crate::gc::{ClassicalHeapGC, GcHandle};
 use crate::StatevectorSim;
 
 /// Runtime value in the Hybrid Classical-Quantum Virtual Machine (`QGoVM`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum VmVal {
     Void,
     Int(i64),
     Float(f64),
     Bool(bool),
     Str(String),
-    Slice(Vec<VmVal>),
-    Struct(String, HashMap<String, VmVal>),
+    Slice(Vec<VmVal>, Option<GcHandle>),
+    Struct(String, HashMap<String, VmVal>, Option<GcHandle>),
     QReg {
         reg: String,
         offset: usize,
@@ -33,7 +34,63 @@ pub enum VmVal {
     },
 }
 
+impl PartialEq for VmVal {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (VmVal::Void, VmVal::Void) => true,
+            (VmVal::Int(a), VmVal::Int(b)) => a == b,
+            (VmVal::Float(a), VmVal::Float(b)) => a == b,
+            (VmVal::Bool(a), VmVal::Bool(b)) => a == b,
+            (VmVal::Str(a), VmVal::Str(b)) => a == b,
+            (VmVal::Slice(a, _), VmVal::Slice(b, _)) => a == b,
+            (VmVal::Struct(na, fa, _), VmVal::Struct(nb, fb, _)) => na == nb && fa == fb,
+            (
+                VmVal::QReg {
+                    reg: ra,
+                    offset: oa,
+                    width: wa,
+                },
+                VmVal::QReg {
+                    reg: rb,
+                    offset: ob,
+                    width: wb,
+                },
+            ) => ra == rb && oa == ob && wa == wb,
+            _ => false,
+        }
+    }
+}
+
 impl VmVal {
+    pub fn gc_handle(&self) -> Option<GcHandle> {
+        match self {
+            VmVal::Slice(_, h) | VmVal::Struct(_, _, h) => *h,
+            _ => None,
+        }
+    }
+
+    pub fn collect_gc_roots(&self, out: &mut Vec<GcHandle>) {
+        match self {
+            VmVal::Slice(items, h) => {
+                if let Some(handle) = h {
+                    out.push(*handle);
+                }
+                for item in items {
+                    item.collect_gc_roots(out);
+                }
+            }
+            VmVal::Struct(_, fields, h) => {
+                if let Some(handle) = h {
+                    out.push(*handle);
+                }
+                for v in fields.values() {
+                    v.collect_gc_roots(out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn as_int(&self) -> i64 {
         match self {
             VmVal::Int(n) => *n,
@@ -67,11 +124,11 @@ impl VmVal {
             VmVal::Float(f) => format!("{}", f),
             VmVal::Bool(b) => b.to_string(),
             VmVal::Void => "void".to_owned(),
-            VmVal::Slice(items) => {
+            VmVal::Slice(items, _) => {
                 let parts: Vec<String> = items.iter().map(|v| v.as_str()).collect();
                 format!("[{}]", parts.join(", "))
             }
-            VmVal::Struct(name, fields) => {
+            VmVal::Struct(name, fields, _) => {
                 let mut pairs: Vec<_> = fields.iter().collect();
                 pairs.sort_by_key(|(k, _)| *k);
                 let s: Vec<String> = pairs
@@ -104,13 +161,16 @@ enum FlowSignal {
     Continue,
 }
 
-/// Hybrid Classical-Quantum Virtual Machine executing `.qg` AST modules with a live `StatevectorSim`.
+/// Hybrid Classical-Quantum Virtual Machine executing `.qg` AST modules with a live `StatevectorSim`
+/// and a Tri-Color Mark-and-Sweep Classical Garbage Collector (`ClassicalHeapGC`).
 pub struct QGoVM {
     pub consts: HashMap<String, VmVal>,
     pub const_uints: HashMap<String, usize>,
     pub structs: HashMap<String, Vec<(String, TypeExpr)>>,
     pub funcs: HashMap<String, FuncDecl>,
     pub sim: StatevectorSim,
+    pub gc: ClassicalHeapGC,
+    pub call_frame_stack: Vec<HashMap<String, VmVal>>,
     pub synth_mode: SynthMode,
     pub stdout: String,
     pub cli_args: Vec<String>,
@@ -128,6 +188,8 @@ impl QGoVM {
             structs: HashMap::new(),
             funcs: HashMap::new(),
             sim: StatevectorSim::new(),
+            gc: ClassicalHeapGC::new(),
+            call_frame_stack: Vec::new(),
             synth_mode,
             stdout: String::new(),
             cli_args: Vec::new(),
@@ -141,6 +203,69 @@ impl QGoVM {
     pub fn with_args(mut self, args: Vec<String>) -> Self {
         self.cli_args = args;
         self
+    }
+
+    fn alloc_slice_val(&mut self, elems: Vec<VmVal>) -> VmVal {
+        let mut child_handles = Vec::with_capacity(elems.len());
+        for e in &elems {
+            if let Some(h) = e.gc_handle() {
+                child_handles.push(Some(h));
+            } else if let VmVal::Str(s) = e {
+                if !s.is_empty() {
+                    child_handles.push(Some(self.gc.alloc_str(s)));
+                } else {
+                    child_handles.push(None);
+                }
+            } else {
+                child_handles.push(None);
+            }
+        }
+        let h = self.gc.alloc_slice(child_handles, 8);
+        VmVal::Slice(elems, Some(h))
+    }
+
+    fn alloc_struct_val(&mut self, name: String, fields: HashMap<String, VmVal>) -> VmVal {
+        let mut field_handles = HashMap::new();
+        for (k, v) in &fields {
+            if let Some(h) = v.gc_handle() {
+                field_handles.insert(k.clone(), Some(h));
+            } else if let VmVal::Str(s) = v {
+                if !s.is_empty() {
+                    field_handles.insert(k.clone(), Some(self.gc.alloc_str(s)));
+                } else {
+                    field_handles.insert(k.clone(), None);
+                }
+            } else {
+                field_handles.insert(k.clone(), None);
+            }
+        }
+        let h = self.gc.alloc_struct(&name, field_handles, 16);
+        VmVal::Struct(name, fields, Some(h))
+    }
+
+    /// Runs a Tri-Color Mark-and-Sweep GC cycle using all active call frames, `current_vars`,
+    /// and an optional return value as the root set.
+    pub fn collect_gc_roots_and_sweep(
+        &mut self,
+        current_vars: &HashMap<String, VmVal>,
+        extra_root: Option<&VmVal>,
+    ) -> usize {
+        let mut roots = Vec::new();
+        for v in self.consts.values() {
+            v.collect_gc_roots(&mut roots);
+        }
+        for frame in &self.call_frame_stack {
+            for v in frame.values() {
+                v.collect_gc_roots(&mut roots);
+            }
+        }
+        for v in current_vars.values() {
+            v.collect_gc_roots(&mut roots);
+        }
+        if let Some(er) = extra_root {
+            er.collect_gc_roots(&mut roots);
+        }
+        self.gc.collect_garbage(&roots)
     }
 
     pub fn load_module(&mut self, ast: &SourceFile) {
@@ -169,26 +294,29 @@ impl QGoVM {
         }
     }
 
-    fn default_val_for_type(&self, ty: &TypeExpr) -> VmVal {
+    fn default_val_for_type(&mut self, ty: &TypeExpr) -> VmVal {
         match ty {
             TypeExpr::Bool => VmVal::Bool(false),
             TypeExpr::Int | TypeExpr::Int64 | TypeExpr::Uint => VmVal::Int(0),
             TypeExpr::Float64 => VmVal::Float(0.0),
             TypeExpr::StringTy => VmVal::Str(String::new()),
-            TypeExpr::Slice(_) => VmVal::Slice(Vec::new()),
+            TypeExpr::Slice(_) => self.alloc_slice_val(Vec::new()),
             TypeExpr::Array(c, inner) => {
                 let n = c.resolve_static(&self.const_uints).unwrap_or(0);
-                let elem = self.default_val_for_type(inner);
-                VmVal::Slice(vec![elem; n])
+                let mut elems = Vec::with_capacity(n);
+                for _ in 0..n {
+                    elems.push(self.default_val_for_type(inner));
+                }
+                self.alloc_slice_val(elems)
             }
             TypeExpr::Named(sname) => {
                 let mut map = HashMap::new();
-                if let Some(fields) = self.structs.get(sname) {
-                    for (fname, fty) in fields {
+                if let Some(fields) = self.structs.get(sname).cloned() {
+                    for (fname, fty) in &fields {
                         map.insert(fname.clone(), self.default_val_for_type(fty));
                     }
                 }
-                VmVal::Struct(sname.clone(), map)
+                self.alloc_struct_val(sname.clone(), map)
             }
             _ => VmVal::Void,
         }
@@ -198,9 +326,19 @@ impl QGoVM {
         let reg_name = format!("{}_{}", prefix, self.next_qreg_id);
         self.next_qreg_id += 1;
         let w = width.max(1);
-        for b in 0..w {
-            self.sim
-                .allocate_wire(QubitWire::new(reg_name.clone(), b), is_ancilla);
+        if is_ancilla && !self.recording_stack.is_empty() {
+            if let Some(buf) = self.recording_stack.last_mut() {
+                buf.push(MirStmt::QAlloc {
+                    reg: reg_name.clone(),
+                    size: w,
+                    is_ancilla: true,
+                });
+            }
+        } else {
+            for b in 0..w {
+                self.sim
+                    .allocate_wire(QubitWire::new(reg_name.clone(), b), is_ancilla);
+            }
         }
         VmVal::QReg {
             reg: reg_name,
@@ -245,10 +383,19 @@ impl QGoVM {
         }
 
         let sig = self.exec_block(&func.body, &mut vars)?;
-        match sig {
-            FlowSignal::Return(v) => Ok(v),
-            _ => Ok(VmVal::Void),
+        let ret_val = match sig {
+            FlowSignal::Return(v) => v,
+            _ => VmVal::Void,
+        };
+
+        // At function exit, `vars` goes out of scope; if heap growth crossed the GC pacing
+        // threshold (`GOGC`), trigger an automatic Tri-Color Mark-and-Sweep collection!
+        if self.gc.should_collect() {
+            let empty_vars = HashMap::new();
+            self.collect_gc_roots_and_sweep(&empty_vars, Some(&ret_val));
         }
+
+        Ok(ret_val)
     }
 
     fn type_qubit_width(&self, ty: &TypeExpr) -> usize {
@@ -296,16 +443,26 @@ impl QGoVM {
                 };
                 let _ = self.eval_expr(&adj_expr, vars)?;
 
-                // Verify ancilla target returned to |0> within 1e-12
+                // Verify ancilla target returned to |0> within 1e-12 and release to physical qubit pool
                 if let Some(tname) = target {
                     if let Some(tval) = vars.get(tname) {
-                        for w in tval.wires() {
-                            let p0 = self.sim.prob_zero(&w);
-                            if (1.0 - p0).abs() >= 1e-12 {
-                                return Err(format!(
-                                    "Ancilla `{}` ({}) not uncomputed to |0> after `defer adj`: P(|0>) = {:.15}",
-                                    tname, w, p0
-                                ));
+                        if self.recording_stack.is_empty() {
+                            for w in tval.wires() {
+                                let p0 = self.sim.prob_zero(&w);
+                                if (1.0 - p0).abs() >= 1e-12 {
+                                    return Err(format!(
+                                        "Ancilla `{}` ({}) not uncomputed to |0> after `defer adj`: P(|0>) = {:.15}",
+                                        tname, w, p0
+                                    ));
+                                }
+                                self.sim.release_wire(&w);
+                            }
+                        } else if let VmVal::QReg { reg, width, .. } = tval {
+                            if let Some(buf) = self.recording_stack.last_mut() {
+                                buf.push(MirStmt::QFree {
+                                    reg: reg.clone(),
+                                    size: *width,
+                                });
                             }
                         }
                     }
@@ -484,7 +641,10 @@ impl QGoVM {
             }
             Expr::FieldAccess { base, field, .. } => {
                 let mut base_val = self.eval_expr(base, vars)?;
-                if let VmVal::Struct(_, ref mut fields) = base_val {
+                if let VmVal::Struct(_, ref mut fields, handle_opt) = base_val {
+                    if let Some(h) = handle_opt {
+                        self.gc.set_struct_field(h, field, new_val.gc_handle());
+                    }
                     fields.insert(field.clone(), new_val);
                 }
                 self.assign_lvalue(base, base_val, vars)
@@ -492,8 +652,11 @@ impl QGoVM {
             Expr::Index { base, index, .. } => {
                 let idx = self.eval_expr(index, vars)?.as_int().max(0) as usize;
                 let mut base_val = self.eval_expr(base, vars)?;
-                if let VmVal::Slice(ref mut elems) = base_val {
+                if let VmVal::Slice(ref mut elems, handle_opt) = base_val {
                     if idx < elems.len() {
+                        if let Some(h) = handle_opt {
+                            self.gc.set_slice_elem(h, idx, new_val.gc_handle());
+                        }
                         elems[idx] = new_val;
                     }
                 }
@@ -663,9 +826,13 @@ impl QGoVM {
         let conj = MirStmt::Conjugate {
             compute,
             action: controlled_action,
-            target: None,
+            target: Some(flag_wire.reg.clone()),
         };
-        self.emit_or_exec_mir(vec![conj]);
+        let free_stmt = MirStmt::QFree {
+            reg: flag_wire.reg.clone(),
+            size: 1,
+        };
+        self.emit_or_exec_mir(vec![conj, free_stmt]);
         Ok(())
     }
 
@@ -711,14 +878,14 @@ impl QGoVM {
                         map.insert(k.clone(), val);
                     }
                 }
-                Ok(VmVal::Struct(name.clone(), map))
+                Ok(self.alloc_struct_val(name.clone(), map))
             }
             Expr::SliceLit { elems, .. } => {
                 let mut out = Vec::with_capacity(elems.len());
                 for e in elems {
                     out.push(self.eval_expr(e, vars)?);
                 }
-                Ok(VmVal::Slice(out))
+                Ok(self.alloc_slice_val(out))
             }
             Expr::QAlloc {
                 size, ty_override, ..
@@ -748,7 +915,7 @@ impl QGoVM {
                 let bval = self.eval_expr(base, vars)?;
                 let idx = self.eval_expr(index, vars)?.as_int().max(0) as usize;
                 match bval {
-                    VmVal::Slice(items) => Ok(items.get(idx).cloned().unwrap_or(VmVal::Void)),
+                    VmVal::Slice(items, _) => Ok(items.get(idx).cloned().unwrap_or(VmVal::Void)),
                     VmVal::Str(s) => {
                         let b = s.as_bytes().get(idx).copied().unwrap_or(0);
                         Ok(VmVal::Int(b as i64))
@@ -770,14 +937,14 @@ impl QGoVM {
                     None => 0,
                 };
                 match bval {
-                    VmVal::Slice(items) => {
+                    VmVal::Slice(items, _) => {
                         let e_idx = match end {
                             Some(ee) => self.eval_expr(ee, vars)?.as_int().max(0) as usize,
                             None => items.len(),
                         };
                         let s = s_idx.min(items.len());
                         let e = e_idx.min(items.len()).max(s);
-                        Ok(VmVal::Slice(items[s..e].to_vec()))
+                        Ok(self.alloc_slice_val(items[s..e].to_vec()))
                     }
                     VmVal::Str(st) => {
                         let e_idx = match end {
@@ -806,7 +973,7 @@ impl QGoVM {
             }
             Expr::FieldAccess { base, field, .. } => {
                 let bval = self.eval_expr(base, vars)?;
-                if let VmVal::Struct(_, fields) = bval {
+                if let VmVal::Struct(_, fields, _) = bval {
                     Ok(fields.get(field).cloned().unwrap_or(VmVal::Void))
                 } else {
                     Ok(VmVal::Void)
@@ -924,7 +1091,7 @@ impl QGoVM {
                 for a in args {
                     eval_args.push(self.eval_expr(a, vars)?);
                 }
-                self.eval_call(callee, eval_args)
+                self.eval_call(callee, eval_args, vars)
             }
         }
     }
@@ -940,7 +1107,12 @@ impl QGoVM {
         }
     }
 
-    fn eval_call(&mut self, callee: &str, args: Vec<VmVal>) -> Result<VmVal, String> {
+    fn eval_call(
+        &mut self,
+        callee: &str,
+        args: Vec<VmVal>,
+        vars: &HashMap<String, VmVal>,
+    ) -> Result<VmVal, String> {
         // 1. Built-in 1-qubit quantum gates (with slice broadcast)
         let one_q = match callee {
             "X" | "NOT" => Some(MirGateKind::X),
@@ -1093,20 +1265,20 @@ impl QGoVM {
             "len" => {
                 let n = match args.first() {
                     Some(VmVal::Str(s)) => s.len() as i64,
-                    Some(VmVal::Slice(v)) => v.len() as i64,
+                    Some(VmVal::Slice(v, _)) => v.len() as i64,
                     Some(VmVal::QReg { width, .. }) => *width as i64,
                     _ => 0,
                 };
                 return Ok(VmVal::Int(n));
             }
             "append" => {
-                if let Some(VmVal::Slice(mut v)) = args.first().cloned() {
+                if let Some(VmVal::Slice(mut v, _)) = args.first().cloned() {
                     for elem in args.into_iter().skip(1) {
                         v.push(elem);
                     }
-                    return Ok(VmVal::Slice(v));
+                    return Ok(self.alloc_slice_val(v));
                 }
-                return Ok(VmVal::Slice(Vec::new()));
+                return Ok(self.alloc_slice_val(Vec::new()));
             }
             "int_to_str" => {
                 let n = args.first().map(|v| v.as_int()).unwrap_or(0);
@@ -1183,11 +1355,11 @@ impl QGoVM {
                     .split(&sep)
                     .map(|p| VmVal::Str(p.to_owned()))
                     .collect();
-                return Ok(VmVal::Slice(parts));
+                return Ok(self.alloc_slice_val(parts));
             }
             "join" => {
                 let sep = args.get(1).map(|v| v.as_str()).unwrap_or_default();
-                if let Some(VmVal::Slice(items)) = args.first() {
+                if let Some(VmVal::Slice(items, _)) = args.first() {
                     let strs: Vec<String> = items.iter().map(|v| v.as_str()).collect();
                     return Ok(VmVal::Str(strs.join(&sep)));
                 }
@@ -1237,7 +1409,7 @@ impl QGoVM {
                     .iter()
                     .map(|s| VmVal::Str(s.clone()))
                     .collect();
-                return Ok(VmVal::Slice(items));
+                return Ok(self.alloc_slice_val(items));
             }
             "assert" => {
                 let cond = args.first().map(|v| v.as_bool()).unwrap_or(false);
@@ -1285,11 +1457,33 @@ impl QGoVM {
                 }
                 return Ok(VmVal::Int(0));
             }
+            "gc_collect" => {
+                let swept = self.collect_gc_roots_and_sweep(vars, None);
+                return Ok(VmVal::Int(swept as i64));
+            }
+            "gc_live_objects" => {
+                return Ok(VmVal::Int(self.gc.live_objects as i64));
+            }
+            "gc_total_swept" => {
+                return Ok(VmVal::Int(self.gc.total_swept_objects as i64));
+            }
+            "gc_live_bytes" => {
+                return Ok(VmVal::Int(self.gc.live_bytes as i64));
+            }
+            "qpool_recycled_count" => {
+                return Ok(VmVal::Int(self.sim.recycled_qubit_count as i64));
+            }
+            "qpool_peak_qubits" => {
+                return Ok(VmVal::Int(self.sim.num_qubits as i64));
+            }
             _ => {}
         }
 
-        // 10. User-defined function call
-        self.call_function(callee, args)
+        // 10. User-defined function call (preserve outer frame roots across GC)
+        self.call_frame_stack.push(vars.clone());
+        let res = self.call_function(callee, args);
+        self.call_frame_stack.pop();
+        res
     }
 }
 
@@ -1351,7 +1545,17 @@ fn expr_touches_ident(expr: &Expr, var: &str) -> bool {
         Expr::Call { callee, args, .. } => {
             if matches!(
                 callee.as_str(),
-                "prob_zero" | "prob_basis" | "peek_uint" | "assert" | "assert_eq"
+                "prob_zero"
+                    | "prob_basis"
+                    | "peek_uint"
+                    | "assert"
+                    | "assert_eq"
+                    | "qpool_recycled_count"
+                    | "qpool_peak_qubits"
+                    | "gc_collect"
+                    | "gc_live_objects"
+                    | "gc_total_swept"
+                    | "gc_live_bytes"
             ) {
                 false
             } else {

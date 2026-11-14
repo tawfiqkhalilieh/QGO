@@ -329,6 +329,7 @@ func GroverIteration(reg qreg[3]) unitary {
             "../../std/qec.qg",
             "../../std/vqe_qaoa.qg",
             "../../std/quantum_walk.qg",
+            "../../std/memory_gc.qg",
         ];
 
         for rel_path in std_files {
@@ -559,6 +560,12 @@ func GroverIteration(reg qreg[3]) unitary {
                 "COINED QUANTUM WALK (8-CYC)",
                 "../../docs/gifs/quantum_walk_memory.gif",
             ),
+            (
+                "../../std/memory_gc.qg",
+                "MultiStageAncillaPipeline",
+                "ANCILLA POOL RECYCLING (3X)",
+                "../../docs/gifs/ancilla_pool_recycling_memory.gif",
+            ),
         ];
 
         for &(rel_src, func_name, title, rel_gif) in gif_specs {
@@ -596,5 +603,43 @@ func GroverIteration(reg qreg[3]) unitary {
             assert_eq!(&bytes[0..6], b"GIF89a", "GIF89a magic header verified");
             assert_eq!(bytes[bytes.len() - 1], 0x3B, "GIF trailer 0x3B verified");
         }
+    }
+
+    #[test]
+    fn test_ancilla_pool_recycling_and_classical_gc_vm_and_native_aot() {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../std/memory_gc.qg");
+        let src = fs::read_to_string(&p).expect("read std/memory_gc.qg");
+        let fname = p.to_string_lossy().to_string();
+
+        // 1. Verify Compiler Pass 4.5 static ancilla pool recycling on `std/memory_gc.qg`
+        let out_qasm = compile_str(&fname, &src, TargetBackend::OpenQasm3, SynthMode::Width)
+            .expect("compile std/memory_gc.qg");
+        assert_eq!(
+            out_qasm.resources.ancilla_qubits, 1,
+            "Peak physical ancilla qubits across 3 sequential oracle stages must be 1"
+        );
+        assert_eq!(
+            out_qasm.resources.recycled_ancillas, 2,
+            "2 ancilla allocations (anc2, anc3) must be recycled from anc1's freed wire"
+        );
+
+        // 2. Verify QGoVM runtime Physical Qubit Pool & Tri-Color Mark-and-Sweep GC
+        let passed = run_tests_vm(&out_qasm.ast, SynthMode::Width)
+            .expect("TestQuantumPoolAndClassicalGC should pass on QGoVM");
+        assert!(passed.contains(&"TestQuantumPoolAndClassicalGC".to_owned()));
+
+        // 3. Verify Native Rust AOT binary execution via `rustc`
+        let tmp_bin = std::env::temp_dir().join("qgo_test_memory_gc_bin");
+        build_native_executable(&fname, &src, SynthMode::Width, &tmp_bin)
+            .expect("Native Rust AOT compilation of std/memory_gc.qg should succeed");
+        let run_out = Command::new(&tmp_bin)
+            .output()
+            .expect("execute native memory_gc binary");
+        let _ = fs::remove_file(&tmp_bin);
+        assert!(
+            run_out.status.success(),
+            "Native memory_gc binary failed:\n{}",
+            String::from_utf8_lossy(&run_out.stderr)
+        );
     }
 }

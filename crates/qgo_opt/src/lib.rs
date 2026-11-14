@@ -2,6 +2,7 @@
 //! `ctrl`-conjugation $U \cdot (\text{ctrl}_c V) \cdot U^\dagger$, and Pass 4 Quantum Expression
 //! & Arithmetic synthesis using Cuccaro ripple-carry or Draper QFT adders).
 
+use std::collections::HashMap;
 use qgo_mir::{
     apply_controls_to_stmt, invert_stmts, MirFunc, MirGateKind, MirModule, MirStmt,
     QuantumCmpKind, QubitWire,
@@ -21,6 +22,7 @@ pub enum SynthMode {
 pub struct ResourceReport {
     pub logical_qubits: usize,
     pub ancilla_qubits: usize,
+    pub recycled_ancillas: usize,
     pub single_qubit_gates: usize,
     pub two_qubit_gates: usize,
     pub toffoli_gates: usize,
@@ -38,8 +40,146 @@ pub fn optimize_module(module: &mut MirModule, mode: SynthMode) {
 pub fn optimize_func(func: &mut MirFunc, mode: SynthMode) {
     // 1. Lower QuantumIf and QuantumArith nodes into Conjugate + Cuccaro/Draper circuits
     func.body = lower_quantum_expressions(std::mem::take(&mut func.body), mode);
-    // 2. Optimize inside Conjugate nodes and cancel adjacent inverse gates U * U_dag
+    // 2. Recycle freed |0> ancilla registers across sequential live ranges via the Physical Qubit Pool
+    func.body = recycle_ancillas(std::mem::take(&mut func.body)).0;
+    // 3. Optimize inside Conjugate nodes and cancel adjacent inverse gates U * U_dag
     func.body = cancel_inverses_recursive(std::mem::take(&mut func.body));
+}
+
+/// Pass 4.5: Physical Qubit Pool & Ancilla Recycling Allocator.
+/// Reuses uncomputed $|0\rangle$ ancilla registers released via `MirStmt::QFree` across
+/// subsequent `MirStmt::QAlloc` live ranges, minimizing peak physical ancilla qubit width.
+pub fn recycle_ancillas(stmts: Vec<MirStmt>) -> (Vec<MirStmt>, usize) {
+    let mut recycler = AncillaPoolRecycler::default();
+    let out = recycler.recycle_block(stmts);
+    (out, recycler.recycled_qubits)
+}
+
+#[derive(Default)]
+struct AncillaPoolRecycler {
+    /// Pool of `(physical_reg_name, width)` ancilla registers verified in $|0\rangle$ and free for reuse.
+    free_pool: Vec<(String, usize)>,
+    /// Active mapping from logical ancilla register name to assigned physical ancilla register name.
+    reg_alias: HashMap<String, String>,
+    /// Cumulative number of ancilla qubits satisfied from `free_pool` without allocating new physical wires.
+    recycled_qubits: usize,
+}
+
+impl AncillaPoolRecycler {
+    fn map_reg(&self, reg: &str) -> String {
+        self.reg_alias
+            .get(reg)
+            .cloned()
+            .unwrap_or_else(|| reg.to_owned())
+    }
+
+    fn map_wire(&self, w: QubitWire) -> QubitWire {
+        QubitWire::new(self.map_reg(&w.reg), w.index)
+    }
+
+    fn recycle_block(&mut self, stmts: Vec<MirStmt>) -> Vec<MirStmt> {
+        let mut out = Vec::with_capacity(stmts.len());
+        for stmt in stmts {
+            match stmt {
+                MirStmt::QAlloc {
+                    reg,
+                    size,
+                    is_ancilla,
+                } => {
+                    if is_ancilla {
+                        if let Some(pos) = self.free_pool.iter().position(|(_, s)| *s == size) {
+                            let (phys_reg, _) = self.free_pool.remove(pos);
+                            self.reg_alias.insert(reg, phys_reg.clone());
+                            self.recycled_qubits += size;
+                            out.push(MirStmt::QAlloc {
+                                reg: phys_reg,
+                                size,
+                                is_ancilla: true,
+                            });
+                        } else {
+                            self.reg_alias.insert(reg.clone(), reg.clone());
+                            out.push(MirStmt::QAlloc {
+                                reg,
+                                size,
+                                is_ancilla: true,
+                            });
+                        }
+                    } else {
+                        out.push(MirStmt::QAlloc {
+                            reg,
+                            size,
+                            is_ancilla: false,
+                        });
+                    }
+                }
+                MirStmt::QFree { reg, size } => {
+                    let phys_reg = self.reg_alias.remove(&reg).unwrap_or(reg);
+                    if !self.free_pool.iter().any(|(r, _)| *r == phys_reg) {
+                        self.free_pool.push((phys_reg.clone(), size));
+                    }
+                    out.push(MirStmt::QFree {
+                        reg: phys_reg,
+                        size,
+                    });
+                }
+                MirStmt::Gate {
+                    kind,
+                    controls,
+                    targets,
+                } => {
+                    out.push(MirStmt::Gate {
+                        kind,
+                        controls: controls.into_iter().map(|w| self.map_wire(w)).collect(),
+                        targets: targets.into_iter().map(|w| self.map_wire(w)).collect(),
+                    });
+                }
+                MirStmt::Conjugate {
+                    compute,
+                    action,
+                    target,
+                } => {
+                    let mapped_target = target.map(|t| self.map_reg(&t));
+                    let new_compute = self.recycle_block(compute);
+                    let new_action = self.recycle_block(action);
+                    out.push(MirStmt::Conjugate {
+                        compute: new_compute,
+                        action: new_action,
+                        target: mapped_target,
+                    });
+                }
+                MirStmt::Measure { qubit, dst_var } => {
+                    out.push(MirStmt::Measure {
+                        qubit: self.map_wire(qubit),
+                        dst_var,
+                    });
+                }
+                MirStmt::Reset { qubit } => {
+                    out.push(MirStmt::Reset {
+                        qubit: self.map_wire(qubit),
+                    });
+                }
+                MirStmt::ClassicalIf {
+                    cond_var,
+                    then_body,
+                    else_body,
+                } => {
+                    out.push(MirStmt::ClassicalIf {
+                        cond_var,
+                        then_body: self.recycle_block(then_body),
+                        else_body: self.recycle_block(else_body),
+                    });
+                }
+                MirStmt::While { cond_var, body } => {
+                    out.push(MirStmt::While {
+                        cond_var,
+                        body: self.recycle_block(body),
+                    });
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    }
 }
 
 /// Flattens `MirStmt::Conjugate` nodes into elementary gate sequences $(U, V, U^\dagger)$
@@ -510,23 +650,45 @@ pub fn estimate_resources(module: &MirModule) -> ResourceReport {
             }
         }
         let flat = flatten_conjugates(&func.body);
+        let mut live_anc = 0usize;
+        let mut peak_anc = 0usize;
+        let mut total_anc_allocs = 0usize;
         for s in &flat {
-            accumulate_stmt_resources(s, &mut report);
+            accumulate_stmt_resources(
+                s,
+                &mut report,
+                &mut live_anc,
+                &mut peak_anc,
+                &mut total_anc_allocs,
+            );
         }
+        report.ancilla_qubits += peak_anc;
+        report.recycled_ancillas += total_anc_allocs.saturating_sub(peak_anc);
     }
     report
 }
 
-fn accumulate_stmt_resources(stmt: &MirStmt, report: &mut ResourceReport) {
+fn accumulate_stmt_resources(
+    stmt: &MirStmt,
+    report: &mut ResourceReport,
+    live_anc: &mut usize,
+    peak_anc: &mut usize,
+    total_anc_allocs: &mut usize,
+) {
     match stmt {
         MirStmt::QAlloc {
             size, is_ancilla, ..
         } => {
             if *is_ancilla {
-                report.ancilla_qubits += *size;
+                *total_anc_allocs += *size;
+                *live_anc += *size;
+                *peak_anc = (*peak_anc).max(*live_anc);
             } else {
                 report.logical_qubits += *size;
             }
+        }
+        MirStmt::QFree { size, .. } => {
+            *live_anc = live_anc.saturating_sub(*size);
         }
         MirStmt::Gate {
             kind,
@@ -554,15 +716,15 @@ fn accumulate_stmt_resources(stmt: &MirStmt, report: &mut ResourceReport) {
             ..
         } => {
             for s in then_body {
-                accumulate_stmt_resources(s, report);
+                accumulate_stmt_resources(s, report, live_anc, peak_anc, total_anc_allocs);
             }
             for s in else_body {
-                accumulate_stmt_resources(s, report);
+                accumulate_stmt_resources(s, report, live_anc, peak_anc, total_anc_allocs);
             }
         }
         MirStmt::While { body, .. } => {
             for s in body {
-                accumulate_stmt_resources(s, report);
+                accumulate_stmt_resources(s, report, live_anc, peak_anc, total_anc_allocs);
             }
         }
         _ => {}
@@ -686,5 +848,44 @@ func BroadcastCancel(reg qreg[4], q qubit) unitary {
             "H(reg[:]); H(reg[:]) and Rz(0.5)*Rz(0.25)*Rz(-0.75) should cancel to 0 gates, got {:?}",
             flat
         );
+    }
+
+    #[test]
+    fn test_physical_ancilla_pool_recycling() {
+        let src = r#"package main
+func OracleA(x qreg[2], anc qubit) qfree {
+    CCX(x[0], x[1], anc)
+}
+func OracleB(x qreg[2], anc qubit) qfree {
+    CX(x[0], anc)
+}
+func SequentialAncillas(x qreg[2]) unitary {
+    a1 := qalloc()
+    OracleA(x, a1)
+    defer adj OracleA(x, a1) -> a1
+    Z(a1)
+
+    a2 := qalloc()
+    OracleB(x, a2)
+    defer adj OracleB(x, a2) -> a2
+    Z(a2)
+
+    a3 := qalloc()
+    OracleA(x, a3)
+    defer adj OracleA(x, a3) -> a3
+    Z(a3)
+}
+"#;
+        let (ast, _) = parse_source(FileId(0), src);
+        let (hir, diags) = check_module(&ast);
+        assert!(diags.is_empty());
+        let mut mir = lower_to_mir(&hir);
+        optimize_module(&mut mir, SynthMode::Width);
+
+        let res = estimate_resources(&mir);
+        // Only 1 peak physical ancilla qubit is needed across all 3 sequential conjugations,
+        // with 2 ancilla allocations recycled from the |0> pool!
+        assert_eq!(res.ancilla_qubits, 1);
+        assert_eq!(res.recycled_ancillas, 2);
     }
 }

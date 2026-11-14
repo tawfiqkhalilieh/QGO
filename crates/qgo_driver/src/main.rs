@@ -98,7 +98,8 @@ fn main() {
             Ok(out) => {
                 println!("=== QGo Quantum Resource Estimate ({}) ===", filepath);
                 println!("Logical Qubits     : {}", out.resources.logical_qubits);
-                println!("Ancilla Qubits     : {}", out.resources.ancilla_qubits);
+                println!("Peak Ancilla Qubits: {}", out.resources.ancilla_qubits);
+                println!("Recycled Ancillas  : {}", out.resources.recycled_ancillas);
                 println!("1-Qubit Gates      : {}", out.resources.single_qubit_gates);
                 println!("2-Qubit Gates      : {}", out.resources.two_qubit_gates);
                 println!("Toffoli (CCX) Gates: {}", out.resources.toffoli_gates);
