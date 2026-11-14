@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/qgo_span",
+    "crates/qgo_lexer",
+    "crates/qgo_syntax",
+    "crates/qgo_hir",
+    "crates/qgo_mir",
+    "crates/qgo_opt",
+    "crates/qgo_codegen_qasm",
+    "crates/qgo_codegen_qir",
+    "crates/qgo_sim",
+    "crates/qgo_lsp",
+    "crates/qgo_driver",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Tawfiq Khalilieh <tawfiq@qgo-lang.org>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tawfiqkhalilieh/qgo"

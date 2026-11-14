@@ -1,0 +1,11 @@
+[package]
+name = "qgo_hir"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+qgo_span = { path = "../qgo_span" }
+qgo_lexer = { path = "../qgo_lexer" }
+qgo_syntax = { path = "../qgo_syntax" }

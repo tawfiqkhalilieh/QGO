@@ -1,0 +1,56 @@
+package vqe_qaoa
+
+// Computes the Ising parity q0 ^ q1 into ancilla `anc` for ZZ Hamiltonian evolution.
+func IsingZZParity(q0 qubit, q1 qubit, anc qubit) qfree {
+    CX(q0, anc)
+    CX(q1, anc)
+}
+
+// QAOA Cost Hamiltonian edge unitary exp(-i * gamma / 2 * Z_0 Z_1)
+// synthesized via `defer adj` phase-gadget conjugation:
+// Compute parity -> Rz(gamma) -> Uncompute parity.
+func QAOACostEdge(q0 qubit, q1 qubit, gamma float64) unitary {
+    anc := qalloc()
+    IsingZZParity(q0, q1, anc)
+    defer adj IsingZZParity(q0, q1, anc) -> anc
+    Rz(gamma, anc)
+}
+
+// QAOA p=1 circuit for MaxCut on a 3-vertex triangle graph K_3.
+func QAOAMaxCutTriangle(reg qreg[3]) unitary {
+    // Initial uniform superposition |+++>
+    H(reg[:])
+
+    // Cost Hamiltonian layer across all 3 edges of K_3 (gamma = -0.6186 rad)
+    QAOACostEdge(reg[0], reg[1], -0.6186)
+    QAOACostEdge(reg[1], reg[2], -0.6186)
+    QAOACostEdge(reg[0], reg[2], -0.6186)
+
+    // Transverse-field Mixer Hamiltonian layer exp(-i * beta * sum X_i)
+    Rx(1.0471975511965976, reg[:])
+}
+
+// Hardware-Efficient Variational Quantum Eigensolver (VQE) Ansatz with Ry/Rz layers and linear CX entangler.
+func VQEHardwareEfficientAnsatz(reg qreg[3]) unitary {
+    Ry(0.7853981633974483, reg[:])
+    CX(reg[0], reg[1])
+    CX(reg[1], reg[2])
+    Rz(0.39269908169872414, reg[:])
+}
+
+func TestQAOAAndVQE() {
+    reg := qalloc[3]()
+    QAOAMaxCutTriangle(reg)
+
+    // In MaxCut on K_3, states |000> (0) and |111> (7) cut 0 edges,
+    // while states {1, 2, 3, 4, 5, 6} cut 2 edges (the maximum cut).
+    // p=1 QAOA amplifies MaxCut probability from 0.75 (random) to ~0.8677.
+    p_uncut := prob_basis(reg, 0) + prob_basis(reg, 7)
+    p_maxcut := 1.0 - p_uncut
+    assert(p_maxcut > 0.865)
+
+    vqe_reg := qalloc[3]()
+    VQEHardwareEfficientAnsatz(vqe_reg)
+    adj VQEHardwareEfficientAnsatz(vqe_reg)
+    assert(prob_basis(vqe_reg, 0) > 0.999999999)
+}

@@ -1,0 +1,34 @@
+package simon
+
+// 2-to-1 Simon oracle with hidden period s = 3 (0b11):
+// f(00) = f(11) = 00, f(01) = f(10) = 01.
+func SimonOraclePeriod3(x qreg[2], y qreg[2]) qfree {
+    CX(x[0], y[0])
+    CX(x[1], y[0])
+}
+
+// Simon's query circuit preparing uniform superposition, querying `SimonOraclePeriod3`,
+// and applying interference Hadamards on the input register `x`.
+func SimonCircuit(x qreg[2], y qreg[2]) unitary {
+    H(x[:])
+    SimonOraclePeriod3(x, y)
+    H(x[:])
+}
+
+func TestSimonPeriod() {
+    x := qalloc[2]()
+    y := qalloc[2]()
+    SimonCircuit(x, y)
+
+    // Only z in {00 (0), 11 (3)} satisfy (z . s) mod 2 == 0 for s = 11 (3).
+    // Orthogonal complements 01 (1) and 10 (2) have destructive interference (P = 0).
+    p0 := prob_basis(x, 0)
+    p1 := prob_basis(x, 1)
+    p2 := prob_basis(x, 2)
+    p3 := prob_basis(x, 3)
+
+    assert(p0 > 0.499999)
+    assert(p3 > 0.499999)
+    assert(p1 < 0.000000001)
+    assert(p2 < 0.000000001)
+}

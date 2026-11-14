@@ -1,0 +1,13 @@
+[package]
+name = "qgo_codegen_qasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+qgo_span = { path = "../qgo_span" }
+qgo_syntax = { path = "../qgo_syntax" }
+qgo_hir = { path = "../qgo_hir" }
+qgo_mir = { path = "../qgo_mir" }
+qgo_opt = { path = "../qgo_opt" }

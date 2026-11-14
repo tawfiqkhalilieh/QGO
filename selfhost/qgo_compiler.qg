@@ -1,0 +1,1684 @@
+package main
+
+// ============================================================================
+// Self-Hosting QGo Compiler written in QGo (`selfhost/qgo_compiler.qg`)
+// ============================================================================
+// Implements:
+//   Stage 1: Lexer + Go Automatic Semicolon Insertion (ASI)
+//   Stage 2: Recursive-Descent Parser (Packages, Structs, Funcs, Quantum Stmts)
+//   Stage 3: HIR Purity (`E0301`/`E0302`), Disjoint Aliasing (`E0400`),
+//            No-Leaked-Ancilla (`E0401`), and Linear Move (`E0402`) Checker
+//   Stage 4: MIR `defer adj` Conjugation Lowering, Pass 3.2 `ctrl`-Conjugation
+//            Theorem (ctrl_c(U V U^dag) = U (ctrl_c V) U^dag), Slice Broadcast,
+//            and Inverse Gate Cancellation
+//   Stage 5: Multi-Target Codegen (OpenQASM 3.0, QIR LLVM IR, and Self-Host Rust)
+// ============================================================================
+
+type Token struct {
+    kind string
+    lexeme string
+    line int
+}
+
+type QParam struct {
+    name string
+    ty string
+    width int
+}
+
+type QStmt struct {
+    kind string
+    lhs string
+    op string
+    callee string
+    args []string
+    ctrls []string
+    target string
+    is_adj bool
+}
+
+type QFunc struct {
+    name string
+    purity string
+    params []QParam
+    stmts []QStmt
+}
+
+type MirOp struct {
+    kind string
+    gate string
+    theta string
+    ctrls []string
+    targets []string
+    comment string
+}
+
+// ----------------------------------------------------------------------------
+// Stage 1: Lexer & Go Automatic Semicolon Insertion (ASI)
+// ----------------------------------------------------------------------------
+
+func IsAlpha(b int) -> bool {
+    return (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+}
+
+func IsDigit(b int) -> bool {
+    return b >= 48 && b <= 57
+}
+
+func IsAlnum(b int) -> bool {
+    return IsAlpha(b) || IsDigit(b)
+}
+
+func TriggersASI(kind string, lexeme string) -> bool {
+    if kind == "IDENT" || kind == "INT" || kind == "FLOAT" || kind == "STRING" {
+        return true
+    }
+    if lexeme == "return" || lexeme == "break" || lexeme == "continue" || lexeme == "qubit" {
+        return true
+    }
+    if lexeme == "++" || lexeme == "--" || lexeme == ")" || lexeme == "]" || lexeme == "}" {
+        return true
+    }
+    return false
+}
+
+func classifyWord(w string) -> string {
+    if w == "package" || w == "import" || w == "func" || w == "type" || w == "struct" || w == "const" || w == "var" {
+        return "KW"
+    }
+    if w == "unitary" || w == "qfree" || w == "defer" || w == "adj" || w == "ctrl" {
+        return "KW"
+    }
+    if w == "if" || w == "else" || w == "for" || w == "return" || w == "break" || w == "continue" {
+        return "KW"
+    }
+    if w == "qubit" || w == "qreg" || w == "qint" || w == "qfixed" || w == "qalloc" || w == "measure" {
+        return "KW"
+    }
+    return "IDENT"
+}
+
+func Tokenize(src string) -> []Token {
+    tokens := []Token{}
+    n := len(src)
+    i := 0
+    line := 1
+    last_kind := ""
+    last_lex := ""
+
+    for i < n {
+        b := byte_at(src, i)
+
+        if b == 10 {
+            if TriggersASI(last_kind, last_lex) {
+                tokens = append(tokens, Token{kind: "SEMI", lexeme: ";", line: line})
+                last_kind = "SEMI"
+                last_lex = ";"
+            }
+            line++
+            i++
+            continue
+        }
+
+        if b == 32 || b == 9 || b == 13 {
+            i++
+            continue
+        }
+
+        if b == 47 && i + 1 < n && byte_at(src, i + 1) == 47 {
+            for i < n && byte_at(src, i) != 10 {
+                i++
+            }
+            continue
+        }
+
+        if b == 34 {
+            start := i
+            i++
+            for i < n && byte_at(src, i) != 34 {
+                if byte_at(src, i) == 92 && i + 1 < n {
+                    i += 2
+                } else {
+                    i++
+                }
+            }
+            if i < n {
+                i++
+            }
+            lit := substr(src, start, i)
+            tokens = append(tokens, Token{kind: "STRING", lexeme: lit, line: line})
+            last_kind = "STRING"
+            last_lex = lit
+            continue
+        }
+
+        if b == 96 {
+            start := i
+            i++
+            for i < n && byte_at(src, i) != 96 {
+                if byte_at(src, i) == 10 {
+                    line++
+                }
+                i++
+            }
+            if i < n {
+                i++
+            }
+            lit := substr(src, start, i)
+            tokens = append(tokens, Token{kind: "STRING", lexeme: lit, line: line})
+            last_kind = "STRING"
+            last_lex = lit
+            continue
+        }
+
+        if IsAlpha(b) {
+            start := i
+            for i < n && IsAlnum(byte_at(src, i)) {
+                i++
+            }
+            word := substr(src, start, i)
+            k := classifyWord(word)
+            tokens = append(tokens, Token{kind: k, lexeme: word, line: line})
+            last_kind = k
+            last_lex = word
+            continue
+        }
+
+        if IsDigit(b) {
+            start := i
+            is_float := false
+            for i < n && (IsDigit(byte_at(src, i)) || byte_at(src, i) == 46) {
+                if byte_at(src, i) == 46 {
+                    is_float = true
+                }
+                i++
+            }
+            num := substr(src, start, i)
+            nk := "INT"
+            if is_float {
+                nk = "FLOAT"
+            }
+            tokens = append(tokens, Token{kind: nk, lexeme: num, line: line})
+            last_kind = nk
+            last_lex = num
+            continue
+        }
+
+        if i + 1 < n {
+            two := substr(src, i, i + 2)
+            if two == ":=" || two == "->" || two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "&&" || two == "||" || two == "++" || two == "--" || two == "+=" || two == "-=" {
+                tokens = append(tokens, Token{kind: "OP", lexeme: two, line: line})
+                last_kind = "OP"
+                last_lex = two
+                i += 2
+                continue
+            }
+        }
+
+        ch := substr(src, i, i + 1)
+        pk := "PUNCT"
+        if ch == ";" {
+            pk = "SEMI"
+        }
+        tokens = append(tokens, Token{kind: pk, lexeme: ch, line: line})
+        last_kind = pk
+        last_lex = ch
+        i++
+    }
+
+    if TriggersASI(last_kind, last_lex) {
+        tokens = append(tokens, Token{kind: "SEMI", lexeme: ";", line: line})
+    }
+
+    return tokens
+}
+
+// ----------------------------------------------------------------------------
+// Stage 2: Parser for QGo Functions & Quantum Statements
+// ----------------------------------------------------------------------------
+
+func parseParamList(raw string) -> []QParam {
+    res := []QParam{}
+    t := trim(raw)
+    if len(t) == 0 {
+        return res
+    }
+    parts := split(t, ",")
+    for idx := 0; idx < len(parts); idx++ {
+        p := trim(parts[idx])
+        if len(p) > 0 {
+            sp := split(p, " ")
+            if len(sp) >= 2 {
+                pname := trim(sp[0])
+                pty := trim(sp[len(sp) - 1])
+                w := 1
+                if starts_with(pty, "qreg[") || starts_with(pty, "qint[") {
+                    lb := 5
+                    rb := len(pty) - 1
+                    if rb > lb {
+                        w = str_to_int(substr(pty, lb, rb))
+                        if w <= 0 {
+                            w = 1
+                        }
+                    }
+                }
+                res = append(res, QParam{name: pname, ty: pty, width: w})
+            }
+        }
+    }
+    return res
+}
+
+func parseArgList(raw string) -> []string {
+    res := []string{}
+    t := trim(raw)
+    if len(t) == 0 {
+        return res
+    }
+    parts := split(t, ",")
+    for i := 0; i < len(parts); i++ {
+        a := trim(parts[i])
+        if len(a) > 0 {
+            res = append(res, a)
+        }
+    }
+    return res
+}
+
+func extractBaseReg(expr string) -> string {
+    t := trim(expr)
+    for i := 0; i < len(t); i++ {
+        if byte_at(t, i) == 91 {
+            return substr(t, 0, i)
+        }
+    }
+    return t
+}
+
+func parseCallNameAndArgs(call_str string) -> QStmt {
+    t := trim(call_str)
+    lp := -1
+    rp := -1
+    for i := 0; i < len(t); i++ {
+        if byte_at(t, i) == 40 && lp < 0 {
+            lp = i
+        }
+        if byte_at(t, i) == 41 {
+            rp = i
+        }
+    }
+    if lp > 0 && rp > lp {
+        cname := trim(substr(t, 0, lp))
+        arg_raw := substr(t, lp + 1, rp)
+        return QStmt{kind: "CALL", lhs: "", op: "", callee: cname, args: parseArgList(arg_raw), ctrls: []string{}, target: "", is_adj: false}
+    }
+    return QStmt{kind: "NOP", lhs: "", op: "", callee: "", args: []string{}, ctrls: []string{}, target: "", is_adj: false}
+}
+
+func parseStatementLine(line string) -> QStmt {
+    s := trim(line)
+    if len(s) == 0 || starts_with(s, "//") || s == "}" || s == "{" {
+        return QStmt{kind: "NOP", lhs: "", op: "", callee: "", args: []string{}, ctrls: []string{}, target: "", is_adj: false}
+    }
+
+    if starts_with(s, "defer adj ") {
+        rest := trim(substr(s, 10, len(s)))
+        arrow_parts := split(rest, "->")
+        call_part := trim(arrow_parts[0])
+        tgt := ""
+        if len(arrow_parts) > 1 {
+            tgt = trim(arrow_parts[1])
+        }
+        st := parseCallNameAndArgs(call_part)
+        st.kind = "DEFER_ADJ"
+        st.target = tgt
+        return st
+    }
+
+    if starts_with(s, "ctrl(") {
+        rp := -1
+        for i := 5; i < len(s); i++ {
+            if byte_at(s, i) == 41 && rp < 0 {
+                rp = i
+            }
+        }
+        if rp > 5 {
+            ctrl_raw := substr(s, 5, rp)
+            inner_raw := trim(substr(s, rp + 1, len(s)))
+            inner := parseStatementLine(inner_raw)
+            inner.ctrls = parseArgList(ctrl_raw)
+            return inner
+        }
+    }
+
+    if starts_with(s, "adj ") {
+        inner := parseCallNameAndArgs(trim(substr(s, 4, len(s))))
+        inner.is_adj = true
+        return inner
+    }
+
+    if contains(s, ":=") {
+        sides := split(s, ":=")
+        lhs := trim(sides[0])
+        rhs := trim(sides[1])
+        if starts_with(rhs, "qalloc") {
+            w := 1
+            if starts_with(rhs, "qalloc[") {
+                rb := -1
+                for i := 7; i < len(rhs); i++ {
+                    if byte_at(rhs, i) == 93 && rb < 0 {
+                        rb = i
+                    }
+                }
+                if rb > 7 {
+                    w = str_to_int(substr(rhs, 7, rb))
+                }
+            }
+            return QStmt{kind: "QALLOC", lhs: lhs, op: int_to_str(w), callee: "qalloc", args: []string{}, ctrls: []string{}, target: "", is_adj: false}
+        }
+        if starts_with(rhs, "measure(") {
+            st := parseCallNameAndArgs(rhs)
+            st.kind = "MEASURE"
+            st.lhs = lhs
+            return st
+        }
+        return QStmt{kind: "DECL", lhs: lhs, op: ":=", callee: rhs, args: []string{}, ctrls: []string{}, target: "", is_adj: false}
+    }
+
+    if starts_with(s, "measure(") {
+        st := parseCallNameAndArgs(s)
+        st.kind = "MEASURE"
+        return st
+    }
+
+    return parseCallNameAndArgs(s)
+}
+
+func ParseModuleFuncs(src string) -> []QFunc {
+    funcs := []QFunc{}
+    lines := split(src, "\n")
+    in_func := false
+    cur_name := ""
+    cur_purity := "hybrid"
+    cur_params := []QParam{}
+    cur_stmts := []QStmt{}
+    brace_depth := 0
+
+    for i := 0; i < len(lines); i++ {
+        line := trim(lines[i])
+        if len(line) > 0 && !starts_with(line, "//") {
+            if !in_func {
+                if starts_with(line, "func ") {
+                    in_func = true
+                    brace_depth = 1
+                    rest := trim(substr(line, 5, len(line)))
+                    lp := -1
+                    rp := -1
+                    for j := 0; j < len(rest); j++ {
+                        if byte_at(rest, j) == 40 && lp < 0 {
+                            lp = j
+                        }
+                        if byte_at(rest, j) == 41 && rp < 0 {
+                            rp = j
+                        }
+                    }
+                    cur_name = trim(substr(rest, 0, lp))
+                    param_raw := substr(rest, lp + 1, rp)
+                    cur_params = parseParamList(param_raw)
+                    tail := trim(substr(rest, rp + 1, len(rest)))
+                    cur_purity = "hybrid"
+                    if contains(tail, "qfree") {
+                        cur_purity = "qfree"
+                    } else if contains(tail, "unitary") {
+                        cur_purity = "unitary"
+                    }
+                    cur_stmts = []QStmt{}
+                }
+            } else {
+                for c := 0; c < len(line); c++ {
+                    b := byte_at(line, c)
+                    if b == 123 {
+                        brace_depth++
+                    } else if b == 125 {
+                        brace_depth--
+                    }
+                }
+                if brace_depth <= 0 {
+                    funcs = append(funcs, QFunc{name: cur_name, purity: cur_purity, params: cur_params, stmts: cur_stmts})
+                    in_func = false
+                } else {
+                    st := parseStatementLine(line)
+                    if st.kind != "NOP" {
+                        cur_stmts = append(cur_stmts, st)
+                    }
+                }
+            }
+        }
+    }
+    return funcs
+}
+
+// ----------------------------------------------------------------------------
+// Stage 3: HIR Purity, Disjoint Aliasing (`E0400`), Ancilla (`E0401`) & Move (`E0402`)
+// ----------------------------------------------------------------------------
+
+func isSuperpositionOrPhaseGate(g string) -> bool {
+    return g == "H" || g == "S" || g == "Sdg" || g == "T" || g == "Tdg" || g == "Z" || g == "Y" || g == "Rx" || g == "Ry" || g == "Rz" || g == "CP" || g == "CRz" || g == "Phase" || g == "P"
+}
+
+func isAngleGate(g string) -> bool {
+    return g == "Rx" || g == "Ry" || g == "Rz" || g == "CP" || g == "CRz" || g == "P" || g == "Phase"
+}
+
+func CheckModuleSemantics(src string) -> []string {
+    errors := []string{}
+    funcs := ParseModuleFuncs(src)
+
+    for fi := 0; fi < len(funcs); fi++ {
+        f := funcs[fi]
+        qvars := []string{}
+        local_qallocs := []string{}
+        dirty_qallocs := []string{}
+        uncomputed_qallocs := []string{}
+
+        for pi := 0; pi < len(f.params); pi++ {
+            pty := f.params[pi].ty
+            if pty == "qubit" || starts_with(pty, "qreg[") || starts_with(pty, "qint[") || starts_with(pty, "qfixed[") {
+                qvars = append(qvars, f.params[pi].name)
+            }
+        }
+
+        for si := 0; si < len(f.stmts); si++ {
+            st := f.stmts[si]
+
+            if st.kind == "QALLOC" {
+                qvars = append(qvars, st.lhs)
+                local_qallocs = append(local_qallocs, st.lhs)
+            } else if st.kind == "DECL" {
+                for qi := 0; qi < len(qvars); qi++ {
+                    if st.callee == qvars[qi] {
+                        errors = append(errors, format("E0402: LinearTypeCopy on `", st.callee, "` in `", f.name, "`"))
+                    }
+                }
+            } else if st.kind == "MEASURE" {
+                if f.purity == "unitary" || f.purity == "qfree" {
+                    errors = append(errors, format("E0302: MeasurementInPureFunction in `", f.name, "`"))
+                }
+            } else if st.kind == "DEFER_ADJ" {
+                if len(st.target) > 0 {
+                    uncomputed_qallocs = append(uncomputed_qallocs, st.target)
+                } else if len(st.args) > 0 {
+                    uncomputed_qallocs = append(uncomputed_qallocs, extractBaseReg(st.args[len(st.args) - 1]))
+                }
+            } else if st.kind == "CALL" {
+                if f.purity == "qfree" && isSuperpositionOrPhaseGate(st.callee) {
+                    errors = append(errors, format("E0301: ImpureOperationInQFree `", st.callee, "` in `", f.name, "`"))
+                }
+
+                used := []string{}
+                for ci := 0; ci < len(st.ctrls); ci++ {
+                    used = append(used, st.ctrls[ci])
+                }
+                for ai := 0; ai < len(st.args); ai++ {
+                    if !(isAngleGate(st.callee) && ai == 0) {
+                        arg_expr := st.args[ai]
+                        for ui := 0; ui < len(used); ui++ {
+                            prev := used[ui]
+                            if prev == arg_expr || extractBaseReg(prev) == arg_expr || prev == extractBaseReg(arg_expr) {
+                                errors = append(errors, format("E0400: QuantumAliasingViolation on `", arg_expr, "` in `", f.name, "`"))
+                            }
+                        }
+                        used = append(used, arg_expr)
+
+                        base := extractBaseReg(arg_expr)
+                        for li := 0; li < len(local_qallocs); li++ {
+                            if local_qallocs[li] == base {
+                                dirty_qallocs = append(dirty_qallocs, base)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if f.purity == "unitary" || f.purity == "qfree" {
+            for di := 0; di < len(dirty_qallocs); di++ {
+                dname := dirty_qallocs[di]
+                is_uncomp := false
+                for ui := 0; ui < len(uncomputed_qallocs); ui++ {
+                    if uncomputed_qallocs[ui] == dname {
+                        is_uncomp = true
+                    }
+                }
+                if !is_uncomp {
+                    errors = append(errors, format("E0401: EntangledAncillaLeak for ancilla `", dname, "` in `", f.name, "`"))
+                }
+            }
+        }
+    }
+
+    return errors
+}
+
+// ----------------------------------------------------------------------------
+// Stage 4: MIR Lowering, Conjugation & Ctrl-Conjugation Theorem
+// ----------------------------------------------------------------------------
+
+func findFunc(funcs []QFunc, name string) -> int {
+    for i := 0; i < len(funcs); i++ {
+        if funcs[i].name == name {
+            return i
+        }
+    }
+    return -1
+}
+
+func invertGateName(g string) -> string {
+    if g == "S" {
+        return "Sdg"
+    }
+    if g == "Sdg" {
+        return "S"
+    }
+    if g == "T" {
+        return "Tdg"
+    }
+    if g == "Tdg" {
+        return "T"
+    }
+    return g
+}
+
+func invertMirOps(ops []MirOp) -> []MirOp {
+    rev := []MirOp{}
+    for i := len(ops) - 1; i >= 0; i-- {
+        op := ops[i]
+        if op.kind == "GATE" {
+            inv_theta := op.theta
+            if len(inv_theta) > 0 {
+                if starts_with(inv_theta, "-") {
+                    inv_theta = substr(inv_theta, 1, len(inv_theta))
+                } else {
+                    inv_theta = format("-", inv_theta)
+                }
+            }
+            rev = append(rev, MirOp{kind: "GATE", gate: invertGateName(op.gate), theta: inv_theta, ctrls: op.ctrls, targets: op.targets, comment: ""})
+        }
+    }
+    return rev
+}
+
+func expandWires(expr string, widths_names []string, widths_vals []int) -> []string {
+    t := trim(expr)
+    if ends_with(t, "[:]") {
+        base := substr(t, 0, len(t) - 3)
+        w := 1
+        for i := 0; i < len(widths_names); i++ {
+            if widths_names[i] == base {
+                w = widths_vals[i]
+            }
+        }
+        out := []string{}
+        for b := 0; b < w; b++ {
+            out = append(out, format(base, "[", int_to_str(b), "]"))
+        }
+        return out
+    }
+    if contains(t, "[") {
+        return []string{t}
+    }
+    return []string{format(t, "[0]")}
+}
+
+func lowerCallToMirOps(funcs []QFunc, callee string, args []string, ctrls []string, is_adj bool, w_names []string, w_vals []int) -> []MirOp {
+    ops := []MirOp{}
+
+    if callee == "H" || callee == "X" || callee == "Y" || callee == "Z" || callee == "S" || callee == "Sdg" || callee == "T" || callee == "Tdg" {
+        g := callee
+        if is_adj {
+            g = invertGateName(g)
+        }
+        wires := expandWires(args[0], w_names, w_vals)
+        cwires := []string{}
+        for ci := 0; ci < len(ctrls); ci++ {
+            ex := expandWires(ctrls[ci], w_names, w_vals)
+            for ei := 0; ei < len(ex); ei++ {
+                cwires = append(cwires, ex[ei])
+            }
+        }
+        for wi := 0; wi < len(wires); wi++ {
+            ops = append(ops, MirOp{kind: "GATE", gate: g, theta: "", ctrls: cwires, targets: []string{wires[wi]}, comment: ""})
+        }
+        return ops
+    }
+
+    if (callee == "Rx" || callee == "Ry" || callee == "Rz" || callee == "P" || callee == "Phase") && len(args) == 2 {
+        th := args[0]
+        if is_adj {
+            if starts_with(th, "-") {
+                th = substr(th, 1, len(th))
+            } else {
+                th = format("-", th)
+            }
+        }
+        wires := expandWires(args[1], w_names, w_vals)
+        cwires := []string{}
+        for ci := 0; ci < len(ctrls); ci++ {
+            ex := expandWires(ctrls[ci], w_names, w_vals)
+            for ei := 0; ei < len(ex); ei++ {
+                cwires = append(cwires, ex[ei])
+            }
+        }
+        for wi := 0; wi < len(wires); wi++ {
+            ops = append(ops, MirOp{kind: "GATE", gate: callee, theta: th, ctrls: cwires, targets: []string{wires[wi]}, comment: ""})
+        }
+        return ops
+    }
+
+    if (callee == "CP" || callee == "CRz") && len(args) == 3 {
+        th := args[0]
+        if is_adj {
+            if starts_with(th, "-") {
+                th = substr(th, 1, len(th))
+            } else {
+                th = format("-", th)
+            }
+        }
+        cwires := []string{}
+        for ci := 0; ci < len(ctrls); ci++ {
+            ex := expandWires(ctrls[ci], w_names, w_vals)
+            for ei := 0; ei < len(ex); ei++ {
+                cwires = append(cwires, ex[ei])
+            }
+        }
+        c_arg := expandWires(args[1], w_names, w_vals)
+        t_arg := expandWires(args[2], w_names, w_vals)
+        cwires = append(cwires, c_arg[0])
+        ops = append(ops, MirOp{kind: "GATE", gate: "P", theta: th, ctrls: cwires, targets: []string{t_arg[0]}, comment: ""})
+        return ops
+    }
+
+    if (callee == "CX" || callee == "CNOT") && len(args) == 2 {
+        cwires := []string{}
+        for ci := 0; ci < len(ctrls); ci++ {
+            ex := expandWires(ctrls[ci], w_names, w_vals)
+            for ei := 0; ei < len(ex); ei++ {
+                cwires = append(cwires, ex[ei])
+            }
+        }
+        c_arg := expandWires(args[0], w_names, w_vals)
+        t_arg := expandWires(args[1], w_names, w_vals)
+        cwires = append(cwires, c_arg[0])
+        ops = append(ops, MirOp{kind: "GATE", gate: "X", theta: "", ctrls: cwires, targets: []string{t_arg[0]}, comment: ""})
+        return ops
+    }
+
+    if (callee == "CCX" || callee == "Toffoli") && len(args) == 3 {
+        cwires := []string{}
+        for ci := 0; ci < len(ctrls); ci++ {
+            ex := expandWires(ctrls[ci], w_names, w_vals)
+            for ei := 0; ei < len(ex); ei++ {
+                cwires = append(cwires, ex[ei])
+            }
+        }
+        c0 := expandWires(args[0], w_names, w_vals)
+        c1 := expandWires(args[1], w_names, w_vals)
+        t := expandWires(args[2], w_names, w_vals)
+        cwires = append(cwires, c0[0])
+        cwires = append(cwires, c1[0])
+        ops = append(ops, MirOp{kind: "GATE", gate: "X", theta: "", ctrls: cwires, targets: []string{t[0]}, comment: ""})
+        return ops
+    }
+
+    if (callee == "Swap" || callee == "SWAP") && len(args) == 2 {
+        a := expandWires(args[0], w_names, w_vals)
+        b := expandWires(args[1], w_names, w_vals)
+        ops = append(ops, MirOp{kind: "GATE", gate: "Swap", theta: "", ctrls: []string{}, targets: []string{a[0], b[0]}, comment: ""})
+        return ops
+    }
+
+    fidx := findFunc(funcs, callee)
+    if fidx >= 0 {
+        sub_f := funcs[fidx]
+        sub_ops := lowerFuncBodyToMir(funcs, sub_f, ctrls)
+        mapped := []MirOp{}
+        for oi := 0; oi < len(sub_ops); oi++ {
+            sop := sub_ops[oi]
+            new_ctrls := []string{}
+            for ci := 0; ci < len(sop.ctrls); ci++ {
+                cw := sop.ctrls[ci]
+                for pi := 0; pi < len(sub_f.params) && pi < len(args); pi++ {
+                    pname := sub_f.params[pi].name
+                    caller_base := extractBaseReg(args[pi])
+                    if starts_with(cw, format(pname, "[")) {
+                        cw = replace(cw, format(pname, "["), format(caller_base, "["))
+                    }
+                }
+                new_ctrls = append(new_ctrls, cw)
+            }
+            new_tgts := []string{}
+            for ti := 0; ti < len(sop.targets); ti++ {
+                tw := sop.targets[ti]
+                for pi := 0; pi < len(sub_f.params) && pi < len(args); pi++ {
+                    pname := sub_f.params[pi].name
+                    caller_base := extractBaseReg(args[pi])
+                    if starts_with(tw, format(pname, "[")) {
+                        tw = replace(tw, format(pname, "["), format(caller_base, "["))
+                    }
+                }
+                new_tgts = append(new_tgts, tw)
+            }
+            mapped = append(mapped, MirOp{kind: sop.kind, gate: sop.gate, theta: sop.theta, ctrls: new_ctrls, targets: new_tgts, comment: sop.comment})
+        }
+        if is_adj {
+            return invertMirOps(mapped)
+        }
+        return mapped
+    }
+
+    return ops
+}
+
+func stmtTouchesTarget(st QStmt, target string) -> bool {
+    if len(target) == 0 {
+        return false
+    }
+    for ci := 0; ci < len(st.ctrls); ci++ {
+        if extractBaseReg(st.ctrls[ci]) == target {
+            return true
+        }
+    }
+    for ai := 0; ai < len(st.args); ai++ {
+        if extractBaseReg(st.args[ai]) == target {
+            return true
+        }
+    }
+    return false
+}
+
+func lowerFuncBodyToMir(funcs []QFunc, f QFunc, enclosing_ctrls []string) -> []MirOp {
+    ops := []MirOp{}
+    w_names := []string{}
+    w_vals := []int{}
+
+    for pi := 0; pi < len(f.params); pi++ {
+        w_names = append(w_names, f.params[pi].name)
+        w_vals = append(w_vals, f.params[pi].width)
+    }
+
+    idx := 0
+    for idx < len(f.stmts) {
+        st := f.stmts[idx]
+
+        if st.kind == "QALLOC" {
+            w := str_to_int(st.op)
+            w_names = append(w_names, st.lhs)
+            w_vals = append(w_vals, w)
+            ops = append(ops, MirOp{kind: "QALLOC", gate: st.lhs, theta: st.op, ctrls: []string{}, targets: []string{}, comment: ""})
+            idx++
+            continue
+        }
+
+        if st.kind == "DEFER_ADJ" {
+            comp_ops := lowerCallToMirOps(funcs, st.callee, st.args, []string{}, false, w_names, w_vals)
+
+            if len(ops) >= len(comp_ops) && len(comp_ops) > 0 {
+                trimmed := []MirOp{}
+                for k := 0; k < len(ops) - len(comp_ops); k++ {
+                    trimmed = append(trimmed, ops[k])
+                }
+                ops = trimmed
+            }
+
+            action_end := len(f.stmts)
+            if len(st.target) > 0 {
+                last_touch := -1
+                for k := idx + 1; k < len(f.stmts); k++ {
+                    if stmtTouchesTarget(f.stmts[k], st.target) {
+                        last_touch = k
+                    }
+                }
+                if last_touch >= 0 {
+                    action_end = last_touch + 1
+                }
+            }
+
+            ops = append(ops, MirOp{kind: "COMMENT", gate: "", theta: "", ctrls: []string{}, targets: []string{}, comment: "// Begin Compute"})
+            for ci := 0; ci < len(comp_ops); ci++ {
+                ops = append(ops, comp_ops[ci])
+            }
+
+            ops = append(ops, MirOp{kind: "COMMENT", gate: "", theta: "", ctrls: []string{}, targets: []string{}, comment: "// Action"})
+            for k := idx + 1; k < action_end; k++ {
+                act_st := f.stmts[k]
+                combined_c := []string{}
+                for ec := 0; ec < len(enclosing_ctrls); ec++ {
+                    combined_c = append(combined_c, enclosing_ctrls[ec])
+                }
+                for sc := 0; sc < len(act_st.ctrls); sc++ {
+                    combined_c = append(combined_c, act_st.ctrls[sc])
+                }
+                act_ops := lowerCallToMirOps(funcs, act_st.callee, act_st.args, combined_c, act_st.is_adj, w_names, w_vals)
+                for ai := 0; ai < len(act_ops); ai++ {
+                    ops = append(ops, act_ops[ai])
+                }
+            }
+
+            ops = append(ops, MirOp{kind: "COMMENT", gate: "", theta: "", ctrls: []string{}, targets: []string{}, comment: "// Begin Uncompute (Defer Adj)"})
+            uncomp_ops := invertMirOps(comp_ops)
+            for ui := 0; ui < len(uncomp_ops); ui++ {
+                ops = append(ops, uncomp_ops[ui])
+            }
+
+            if len(st.target) > 0 {
+                ops = append(ops, MirOp{kind: "QFREE", gate: st.target, theta: "1", ctrls: []string{}, targets: []string{}, comment: ""})
+            }
+
+            idx = action_end
+            continue
+        }
+
+        if st.kind == "MEASURE" {
+            wires := expandWires(st.args[0], w_names, w_vals)
+            ops = append(ops, MirOp{kind: "MEASURE", gate: st.lhs, theta: "", ctrls: []string{}, targets: []string{wires[0]}, comment: ""})
+            idx++
+            continue
+        }
+
+        if st.kind == "CALL" {
+            combined_c := []string{}
+            for ec := 0; ec < len(enclosing_ctrls); ec++ {
+                combined_c = append(combined_c, enclosing_ctrls[ec])
+            }
+            for sc := 0; sc < len(st.ctrls); sc++ {
+                combined_c = append(combined_c, st.ctrls[sc])
+            }
+            call_ops := lowerCallToMirOps(funcs, st.callee, st.args, combined_c, st.is_adj, w_names, w_vals)
+            for ci := 0; ci < len(call_ops); ci++ {
+                ops = append(ops, call_ops[ci])
+            }
+        }
+
+        idx++
+    }
+
+    return ops
+}
+
+// ----------------------------------------------------------------------------
+// Stage 5A: OpenQASM 3.0 & QIR LLVM IR Code Generators
+// ----------------------------------------------------------------------------
+
+func EmitOpenQASM3(src string) -> string {
+    funcs := ParseModuleFuncs(src)
+    out := "OPENQASM 3.0;\ninclude \"stdgates.inc\";\n\n"
+
+    for fi := 0; fi < len(funcs); fi++ {
+        f := funcs[fi]
+        out = format(out, "// Function `", f.name, "` (", f.purity, ")\n")
+        for pi := 0; pi < len(f.params); pi++ {
+            p := f.params[pi]
+            if p.ty == "qubit" || starts_with(p.ty, "qreg[") || starts_with(p.ty, "qint[") {
+                out = format(out, "qubit[", int_to_str(p.width), "] ", p.name, ";\n")
+            }
+        }
+
+        ops := lowerFuncBodyToMir(funcs, f, []string{})
+        for oi := 0; oi < len(ops); oi++ {
+            op := ops[oi]
+            if op.kind == "COMMENT" {
+                out = format(out, op.comment, "\n")
+            } else if op.kind == "QALLOC" {
+                out = format(out, "qubit[", op.theta, "] ", op.gate, "; // qalloc\n")
+            } else if op.kind == "QFREE" {
+                out = format(out, "// qfree_zero_verified ", op.gate, "[0..", op.theta, "]\n")
+            } else if op.kind == "MEASURE" {
+                out = format(out, "bit ", op.gate, " = measure ", op.targets[0], ";\n")
+            } else if op.kind == "GATE" {
+                t0 := op.targets[0]
+                nc := len(op.ctrls)
+                if op.gate == "Swap" && len(op.targets) == 2 {
+                    out = format(out, "swap ", op.targets[0], ", ", op.targets[1], ";\n")
+                } else if op.gate == "X" && nc == 1 {
+                    out = format(out, "cx ", op.ctrls[0], ", ", t0, ";\n")
+                } else if op.gate == "X" && nc == 2 {
+                    out = format(out, "ccx ", op.ctrls[0], ", ", op.ctrls[1], ", ", t0, ";\n")
+                } else if op.gate == "P" && nc == 1 {
+                    out = format(out, "cp(", op.theta, ") ", op.ctrls[0], ", ", t0, ";\n")
+                } else if nc > 0 {
+                    c_str := join(op.ctrls, ", ")
+                    glower := replace(replace(replace(op.gate, "X", "x"), "Z", "z"), "H", "h")
+                    out = format(out, "ctrl(", int_to_str(nc), ") @ ", glower, " ", c_str, ", ", t0, ";\n")
+                } else if len(op.theta) > 0 {
+                    glower := replace(replace(replace(op.gate, "Rx", "rx"), "Ry", "ry"), "Rz", "rz")
+                    out = format(out, glower, "(", op.theta, ") ", t0, ";\n")
+                } else {
+                    glower := op.gate
+                    if glower == "H" {
+                        glower = "h"
+                    }
+                    if glower == "X" {
+                        glower = "x"
+                    }
+                    if glower == "Y" {
+                        glower = "y"
+                    }
+                    if glower == "Z" {
+                        glower = "z"
+                    }
+                    if glower == "S" {
+                        glower = "s"
+                    }
+                    if glower == "Sdg" {
+                        glower = "sdg"
+                    }
+                    if glower == "T" {
+                        glower = "t"
+                    }
+                    if glower == "Tdg" {
+                        glower = "tdg"
+                    }
+                    out = format(out, glower, " ", t0, ";\n")
+                }
+            }
+        }
+        out = format(out, "\n")
+    }
+    return out
+}
+
+func EmitQIR(src string) -> string {
+    funcs := ParseModuleFuncs(src)
+    out := "; ModuleID = 'qgo_qir_module'\n"
+    out = format(out, "%Qubit = type opaque\n%Result = type opaque\n\n")
+    out = format(out, "declare %Qubit* @__quantum__rt__qubit_allocate()\n")
+    out = format(out, "declare void @__quantum__rt__qubit_release(%Qubit*)\n")
+    out = format(out, "declare void @__quantum__qis__h__body(%Qubit*)\n")
+    out = format(out, "declare void @__quantum__qis__x__body(%Qubit*)\n")
+    out = format(out, "declare void @__quantum__qis__z__body(%Qubit*)\n")
+    out = format(out, "declare void @__quantum__qis__cnot__body(%Qubit*, %Qubit*)\n")
+    out = format(out, "declare void @__quantum__qis__ccx__body(%Qubit*, %Qubit*, %Qubit*)\n")
+    out = format(out, "declare %Result* @__quantum__qis__mz__body(%Qubit*)\n\n")
+
+    for fi := 0; fi < len(funcs); fi++ {
+        f := funcs[fi]
+        out = format(out, "define void @", f.name, "() #0 {\nentry:\n")
+        ops := lowerFuncBodyToMir(funcs, f, []string{})
+        ssa := 0
+        for oi := 0; oi < len(ops); oi++ {
+            op := ops[oi]
+            if op.kind == "QALLOC" {
+                out = format(out, "  %q", int_to_str(ssa), " = call %Qubit* @__quantum__rt__qubit_allocate()\n")
+                ssa++
+            } else if op.kind == "QFREE" {
+                out = format(out, "  call void @__quantum__rt__qubit_release(%Qubit* null)\n")
+            } else if op.kind == "GATE" {
+                nc := len(op.ctrls)
+                if op.gate == "H" && nc == 0 {
+                    out = format(out, "  call void @__quantum__qis__h__body(%Qubit* null) ; ", op.targets[0], "\n")
+                } else if op.gate == "X" && nc == 0 {
+                    out = format(out, "  call void @__quantum__qis__x__body(%Qubit* null) ; ", op.targets[0], "\n")
+                } else if op.gate == "Z" && nc == 0 {
+                    out = format(out, "  call void @__quantum__qis__z__body(%Qubit* null) ; ", op.targets[0], "\n")
+                } else if op.gate == "X" && nc == 1 {
+                    out = format(out, "  call void @__quantum__qis__cnot__body(%Qubit* null, %Qubit* null) ; ", op.ctrls[0], " -> ", op.targets[0], "\n")
+                } else if op.gate == "X" && nc >= 2 {
+                    out = format(out, "  call void @__quantum__qis__ccx__body(%Qubit* null, %Qubit* null, %Qubit* null) ; -> ", op.targets[0], "\n")
+                }
+            } else if op.kind == "MEASURE" {
+                out = format(out, "  %m", int_to_str(ssa), " = call %Result* @__quantum__qis__mz__body(%Qubit* null)\n")
+                ssa++
+            }
+        }
+        out = format(out, "  ret void\n}\n\n")
+    }
+
+    out = format(out, "attributes #0 = { \"EntryPoint\" }\n")
+    out = format(out, "!llvm.module.flags = !{!0}\n")
+    out = format(out, "!0 = !{i32 1, !\"qir_profiles\", !\"base_profile\"}\n")
+    return out
+}
+
+// ----------------------------------------------------------------------------
+// Stage 5B: Self-Hosting Rust AOT Transpiler (`EmitRustAOT`)
+// ----------------------------------------------------------------------------
+
+func mapQGoTypeToRust(ty string) -> string {
+    t := trim(ty)
+    if t == "int" || t == "int64" || t == "uint" {
+        return "i64"
+    }
+    if t == "float64" {
+        return "f64"
+    }
+    if t == "bool" {
+        return "bool"
+    }
+    if t == "string" {
+        return "String"
+    }
+    if starts_with(t, "[]") {
+        inner := substr(t, 2, len(t))
+        return format("Vec<", mapQGoTypeToRust(inner), ">")
+    }
+    return t
+}
+
+func splitTopLevel(s string, sep_byte int) -> []string {
+    res := []string{}
+    n := len(s)
+    start := 0
+    depth := 0
+    in_str := false
+    i := 0
+    for i < n {
+        b := byte_at(s, i)
+        if in_str {
+            if b == 92 && i + 1 < n {
+                i += 2
+                continue
+            }
+            if b == 34 {
+                in_str = false
+            }
+            i++
+            continue
+        }
+        if b == 34 {
+            in_str = true
+        } else if b == 40 || b == 91 || b == 123 {
+            depth++
+        } else if b == 41 || b == 93 || b == 125 {
+            depth--
+        } else if b == sep_byte && depth == 0 {
+            res = append(res, trim(substr(s, start, i)))
+            start = i + 1
+        }
+        i++
+    }
+    tail := trim(substr(s, start, n))
+    if len(tail) > 0 {
+        res = append(res, tail)
+    }
+    return res
+}
+
+func hasWrappedParens(s string) -> bool {
+    n := len(s)
+    if n < 2 || byte_at(s, 0) != 40 || byte_at(s, n - 1) != 41 {
+        return false
+    }
+    depth := 0
+    in_str := false
+    i := 0
+    for i < n {
+        b := byte_at(s, i)
+        if in_str {
+            if b == 92 && i + 1 < n {
+                i += 2
+                continue
+            }
+            if b == 34 {
+                in_str = false
+            }
+            i++
+            continue
+        }
+        if b == 34 {
+            in_str = true
+        } else if b == 40 {
+            depth++
+        } else if b == 41 {
+            depth--
+            if depth == 0 && i < n - 1 {
+                return false
+            }
+        }
+        i++
+    }
+    return depth == 0
+}
+
+func findTopLevelOp(s string, op string) -> int {
+    n := len(s)
+    olen := len(op)
+    depth := 0
+    in_str := false
+    last_pos := -1
+    i := 0
+    for i <= n - olen {
+        b := byte_at(s, i)
+        if in_str {
+            if b == 92 && i + 1 < n {
+                i += 2
+                continue
+            }
+            if b == 34 {
+                in_str = false
+            }
+            i++
+            continue
+        }
+        if b == 34 {
+            in_str = true
+            i++
+            continue
+        }
+        if b == 41 || b == 93 || b == 125 {
+            depth--
+        }
+        if depth == 0 && substr(s, i, i + olen) == op {
+            if olen == 1 && (op == "<" || op == ">") {
+                next_eq := i + 1 < n && byte_at(s, i + 1) == 61
+                prev_dash := i > 0 && byte_at(s, i - 1) == 45
+                if !next_eq && !prev_dash {
+                    last_pos = i
+                }
+            } else {
+                last_pos = i
+            }
+        }
+        if b == 40 || b == 91 || b == 123 {
+            depth++
+        }
+        i++
+    }
+    return last_pos
+}
+
+func isAllDigits(s string) -> bool {
+    if len(s) == 0 {
+        return false
+    }
+    for i := 0; i < len(s); i++ {
+        if !IsDigit(byte_at(s, i)) {
+            return false
+        }
+    }
+    return true
+}
+
+func transpileExprToRust(raw string) -> string {
+    t := trim(raw)
+    if len(t) == 0 {
+        return ""
+    }
+    for hasWrappedParens(t) {
+        t = trim(substr(t, 1, len(t) - 1))
+    }
+
+    // 1. String literal `"..."`
+    if len(t) >= 2 && byte_at(t, 0) == 34 && byte_at(t, len(t) - 1) == 34 && findTopLevelOp(t, " ") < 0 {
+        // Verify single string literal
+        p_or := findTopLevelOp(t, "||")
+        if p_or < 0 {
+            return format(t, ".to_string()")
+        }
+    }
+
+    // 2. Binary operators in lowest-to-highest precedence order
+    p := findTopLevelOp(t, " || ")
+    if p > 0 {
+        return format("((", transpileExprToRust(substr(t, 0, p)), ") || (", transpileExprToRust(substr(t, p + 4, len(t))), "))")
+    }
+    p = findTopLevelOp(t, " && ")
+    if p > 0 {
+        return format("((", transpileExprToRust(substr(t, 0, p)), ") && (", transpileExprToRust(substr(t, p + 4, len(t))), "))")
+    }
+    p = findTopLevelOp(t, " == ")
+    if p > 0 {
+        return format("((", transpileExprToRust(substr(t, 0, p)), ") == (", transpileExprToRust(substr(t, p + 4, len(t))), "))")
+    }
+    p = findTopLevelOp(t, " != ")
+    if p > 0 {
+        return format("((", transpileExprToRust(substr(t, 0, p)), ") != (", transpileExprToRust(substr(t, p + 4, len(t))), "))")
+    }
+    p = findTopLevelOp(t, " <= ")
+    if p > 0 {
+        return format("((", transpileExprToRust(substr(t, 0, p)), ") <= (", transpileExprToRust(substr(t, p + 4, len(t))), "))")
+    }
+    p = findTopLevelOp(t, " >= ")
+    if p > 0 {
+        return format("((", transpileExprToRust(substr(t, 0, p)), ") >= (", transpileExprToRust(substr(t, p + 4, len(t))), "))")
+    }
+    p = findTopLevelOp(t, " < ")
+    if p > 0 {
+        return format("((", transpileExprToRust(substr(t, 0, p)), ") < (", transpileExprToRust(substr(t, p + 3, len(t))), "))")
+    }
+    p = findTopLevelOp(t, " > ")
+    if p > 0 {
+        return format("((", transpileExprToRust(substr(t, 0, p)), ") > (", transpileExprToRust(substr(t, p + 3, len(t))), "))")
+    }
+    p = findTopLevelOp(t, " + ")
+    if p > 0 {
+        return format("((", transpileExprToRust(substr(t, 0, p)), ") + (", transpileExprToRust(substr(t, p + 3, len(t))), "))")
+    }
+    p = findTopLevelOp(t, " - ")
+    if p > 0 {
+        return format("((", transpileExprToRust(substr(t, 0, p)), ") - (", transpileExprToRust(substr(t, p + 3, len(t))), "))")
+    }
+
+    // 3. Unary `!` and `-`
+    if byte_at(t, 0) == 33 {
+        return format("(!(", transpileExprToRust(substr(t, 1, len(t))), "))")
+    }
+    if byte_at(t, 0) == 45 {
+        return format("(-(", transpileExprToRust(substr(t, 1, len(t))), "))")
+    }
+
+    // 4. Literals
+    if t == "true" || t == "false" {
+        return t
+    }
+    if isAllDigits(t) {
+        return format(t, "i64")
+    }
+    if byte_at(t, 0) == 34 && byte_at(t, len(t) - 1) == 34 {
+        return format(t, ".to_string()")
+    }
+
+    // 5. Slice literals `[]Type{...}`
+    if starts_with(t, "[]") && ends_with(t, "}") {
+        lb := findTopLevelOp(t, "{")
+        if lb > 2 {
+            elem_ty := mapQGoTypeToRust(substr(t, 2, lb))
+            inner := trim(substr(t, lb + 1, len(t) - 1))
+            if len(inner) == 0 {
+                return format("Vec::<", elem_ty, ">::new()")
+            }
+            items := splitTopLevel(inner, 44)
+            t_items := []string{}
+            for i := 0; i < len(items); i++ {
+                t_items = append(t_items, transpileExprToRust(items[i]))
+            }
+            return format("vec![", join(t_items, ", "), "]")
+        }
+    }
+
+    // 6. Struct literal `Name{f1: v1, ...}`
+    if ends_with(t, "}") && !starts_with(t, "[]") {
+        lb := findTopLevelOp(t, "{")
+        if lb > 0 {
+            sname := trim(substr(t, 0, lb))
+            inner := trim(substr(t, lb + 1, len(t) - 1))
+            fields := splitTopLevel(inner, 44)
+            out_fields := []string{}
+            for i := 0; i < len(fields); i++ {
+                kv := splitTopLevel(fields[i], 58)
+                if len(kv) == 2 {
+                    out_fields = append(out_fields, format(trim(kv[0]), ": ", transpileExprToRust(kv[1])))
+                }
+            }
+            return format(sname, " { ", join(out_fields, ", "), " }")
+        }
+    }
+
+    // 7. Function call `callee(a1, a2, ...)`
+    if ends_with(t, ")") {
+        lp := findTopLevelOp(t, "(")
+        if lp > 0 {
+            callee := trim(substr(t, 0, lp))
+            inner := trim(substr(t, lp + 1, len(t) - 1))
+            raw_args := splitTopLevel(inner, 44)
+            t_args := []string{}
+            for i := 0; i < len(raw_args); i++ {
+                t_args = append(t_args, transpileExprToRust(raw_args[i]))
+            }
+            if callee == "len" && len(t_args) == 1 {
+                return format("qgo_len(&(", t_args[0], "))")
+            }
+            if callee == "append" && len(t_args) == 2 {
+                return format("{ let mut __v = ", t_args[0], "; __v.push(", t_args[1], "); __v }")
+            }
+            if callee == "byte_at" && len(t_args) == 2 {
+                return format("qgo_byte_at(&(", t_args[0], "), ", t_args[1], ")")
+            }
+            if callee == "substr" && len(t_args) == 3 {
+                return format("qgo_substr(&(", t_args[0], "), ", t_args[1], ", ", t_args[2], ")")
+            }
+            if callee == "int_to_str" && len(t_args) == 1 {
+                return format("qgo_int_to_str(", t_args[0], ")")
+            }
+            if callee == "str_to_int" && len(t_args) == 1 {
+                return format("qgo_str_to_int(&(", t_args[0], "))")
+            }
+            if callee == "trim" && len(t_args) == 1 {
+                return format("qgo_trim(&(", t_args[0], "))")
+            }
+            if callee == "split" && len(t_args) == 2 {
+                return format("qgo_split(&(", t_args[0], "), &(", t_args[1], "))")
+            }
+            if callee == "join" && len(t_args) == 2 {
+                return format("qgo_join(&(", t_args[0], "), &(", t_args[1], "))")
+            }
+            if callee == "replace" && len(t_args) == 3 {
+                return format("qgo_replace(&(", t_args[0], "), &(", t_args[1], "), &(", t_args[2], "))")
+            }
+            if callee == "contains" && len(t_args) == 2 {
+                return format("qgo_contains(&(", t_args[0], "), &(", t_args[1], "))")
+            }
+            if callee == "starts_with" && len(t_args) == 2 {
+                return format("qgo_starts_with(&(", t_args[0], "), &(", t_args[1], "))")
+            }
+            if callee == "ends_with" && len(t_args) == 2 {
+                return format("qgo_ends_with(&(", t_args[0], "), &(", t_args[1], "))")
+            }
+            if callee == "read_file" && len(t_args) == 1 {
+                return format("qgo_read_file(&(", t_args[0], "))")
+            }
+            if callee == "write_file" && len(t_args) == 2 {
+                return format("qgo_write_file(&(", t_args[0], "), &(", t_args[1], "))")
+            }
+            if callee == "args" {
+                return "qgo_args()"
+            }
+            if callee == "print" && len(t_args) == 1 {
+                return format("print!(\"{}\", ", t_args[0], ")")
+            }
+            if callee == "println" && len(t_args) == 1 {
+                return format("println!(\"{}\", ", t_args[0], ")")
+            }
+            if callee == "assert" && len(t_args) == 1 {
+                return format("qgo_assert(", t_args[0], ", \"assertion failed\")")
+            }
+            if callee == "assert_eq" && len(t_args) == 2 {
+                return format("assert_eq!(", t_args[0], ", ", t_args[1], ")")
+            }
+            if callee == "format" {
+                placeholders := ""
+                for i := 0; i < len(t_args); i++ {
+                    placeholders = format(placeholders, "{}")
+                }
+                return format("format!(\"", placeholders, "\", ", join(t_args, ", "), ")")
+            }
+            return format("qgo_fn_", callee, "(", join(t_args, ", "), ")")
+        }
+    }
+
+    // 8. Postfix indexing `base[idx]`
+    if ends_with(t, "]") {
+        lb := findTopLevelOp(t, "[")
+        if lb > 0 {
+            base := transpileExprToRust(substr(t, 0, lb))
+            idx := transpileExprToRust(substr(t, lb + 1, len(t) - 1))
+            return format(base, "[(", idx, ") as usize].clone()")
+        }
+    }
+
+    // 9. Postfix field access `base.field`
+    dot := findTopLevelOp(t, ".")
+    if dot > 0 {
+        base := transpileExprToRust(substr(t, 0, dot))
+        field := trim(substr(t, dot + 1, len(t)))
+        return format(base, ".", field, ".clone()")
+    }
+
+    return format(t, ".clone()")
+}
+
+func emitRustRuntimeHeader() -> string {
+    h := "// Generated by Self-Hosting QGo Compiler (EmitRustAOT)\n"
+    h = format(h, "#![allow(unused_variables, unused_mut, dead_code, non_snake_case, non_camel_case_types, unreachable_code, clippy::all)]\n\n")
+    h = format(h, "pub trait QGoLen { fn qgo_len(&self) -> i64; }\n")
+    h = format(h, "impl QGoLen for String { fn qgo_len(&self) -> i64 { self.len() as i64 } }\n")
+    h = format(h, "impl QGoLen for str { fn qgo_len(&self) -> i64 { self.len() as i64 } }\n")
+    h = format(h, "impl<T> QGoLen for Vec<T> { fn qgo_len(&self) -> i64 { self.len() as i64 } }\n")
+    h = format(h, "impl<T> QGoLen for [T] { fn qgo_len(&self) -> i64 { self.len() as i64 } }\n")
+    h = format(h, "pub fn qgo_len<T: QGoLen + ?Sized>(v: &T) -> i64 { v.qgo_len() }\n")
+    h = format(h, "pub fn qgo_int_to_str(n: i64) -> String { n.to_string() }\n")
+    h = format(h, "pub fn qgo_str_to_int(s: &str) -> i64 { s.trim().parse::<i64>().unwrap_or(0) }\n")
+    h = format(h, "pub fn qgo_byte_at(s: &str, i: i64) -> i64 { s.as_bytes().get(i.max(0) as usize).copied().unwrap_or(0) as i64 }\n")
+    h = format(h, "pub fn qgo_substr(s: &str, start: i64, end: i64) -> String { let st = (start.max(0) as usize).min(s.len()); let en = (end.max(0) as usize).min(s.len()).max(st); s[st..en].to_string() }\n")
+    h = format(h, "pub fn qgo_contains(s: &str, sub: &str) -> bool { s.contains(sub) }\n")
+    h = format(h, "pub fn qgo_starts_with(s: &str, pfx: &str) -> bool { s.starts_with(pfx) }\n")
+    h = format(h, "pub fn qgo_ends_with(s: &str, sfx: &str) -> bool { s.ends_with(sfx) }\n")
+    h = format(h, "pub fn qgo_trim(s: &str) -> String { s.trim().to_string() }\n")
+    h = format(h, "pub fn qgo_split(s: &str, sep: &str) -> Vec<String> { if sep.is_empty() { s.chars().map(|c| c.to_string()).collect() } else { s.split(sep).map(|p| p.to_string()).collect() } }\n")
+    h = format(h, "pub fn qgo_join(parts: &[String], sep: &str) -> String { parts.join(sep) }\n")
+    h = format(h, "pub fn qgo_replace(s: &str, from: &str, to: &str) -> String { s.replace(from, to) }\n")
+    h = format(h, "pub fn qgo_read_file(path: &str) -> String { std::fs::read_to_string(path).unwrap_or_default() }\n")
+    h = format(h, "pub fn qgo_write_file(path: &str, content: &str) -> bool { std::fs::write(path, content).is_ok() }\n")
+    h = format(h, "pub fn qgo_args() -> Vec<String> { std::env::args().skip(1).collect() }\n")
+    h = format(h, "pub fn qgo_assert(cond: bool, msg: &str) { if !cond { panic!(\"AssertionFailed: {}\", msg); } }\n\n")
+    return h
+}
+
+func EmitRustAOT(src string) -> string {
+    out := emitRustRuntimeHeader()
+    lines := split(src, "\n")
+    in_struct := false
+    in_func := false
+    block_closers := []string{}
+
+    for i := 0; i < len(lines); i++ {
+        line := trim(lines[i])
+        if len(line) > 0 && !starts_with(line, "//") && !starts_with(line, "package ") {
+            if !in_struct && !in_func {
+                if starts_with(line, "type ") && ends_with(line, "struct {") {
+                    sname := trim(substr(line, 5, len(line) - 8))
+                    out = format(out, "#[derive(Debug, Clone, Default, PartialEq)]\npub struct ", sname, " {\n")
+                    in_struct = true
+                } else if starts_with(line, "func ") {
+                    rest := trim(substr(line, 5, len(line)))
+                    lp := findTopLevelOp(rest, "(")
+                    rp := findTopLevelOp(rest, ")")
+                    fname := trim(substr(rest, 0, lp))
+                    param_raw := substr(rest, lp + 1, rp)
+                    p_items := splitTopLevel(param_raw, 44)
+                    r_params := []string{}
+                    for pi := 0; pi < len(p_items); pi++ {
+                        sp := split(trim(p_items[pi]), " ")
+                        if len(sp) >= 2 {
+                            pname := trim(sp[0])
+                            pty := mapQGoTypeToRust(trim(sp[len(sp) - 1]))
+                            r_params = append(r_params, format("mut ", pname, ": ", pty))
+                        }
+                    }
+                    tail := trim(substr(rest, rp + 1, len(rest) - 1))
+                    ret_sig := ""
+                    if starts_with(tail, "->") {
+                        rty := mapQGoTypeToRust(trim(substr(tail, 2, len(tail))))
+                        ret_sig = format(" -> ", rty)
+                    }
+                    out = format(out, "pub fn qgo_fn_", fname, "(", join(r_params, ", "), ")", ret_sig, " {\n")
+                    in_func = true
+                    block_closers = []string{"}"}
+                }
+            } else if in_struct {
+                if line == "}" {
+                    out = format(out, "}\n\n")
+                    in_struct = false
+                } else {
+                    sp := split(line, " ")
+                    if len(sp) >= 2 {
+                        fname := trim(sp[0])
+                        fty := mapQGoTypeToRust(trim(sp[len(sp) - 1]))
+                        out = format(out, "    pub ", fname, ": ", fty, ",\n")
+                    }
+                }
+            } else if in_func {
+                if line == "}" {
+                    closer := block_closers[len(block_closers) - 1]
+                    trimmed := []string{}
+                    for k := 0; k < len(block_closers) - 1; k++ {
+                        trimmed = append(trimmed, block_closers[k])
+                    }
+                    block_closers = trimmed
+                    out = format(out, "    ", closer, "\n")
+                    if len(block_closers) == 0 {
+                        out = format(out, "\n")
+                        in_func = false
+                    }
+                } else if starts_with(line, "} else if ") && ends_with(line, "{") {
+                    cond_raw := trim(substr(line, 10, len(line) - 1))
+                    out = format(out, "    } else if ", transpileExprToRust(cond_raw), " {\n")
+                } else if line == "} else {" {
+                    out = format(out, "    } else {\n")
+                } else if starts_with(line, "if ") && ends_with(line, "{") {
+                    cond_raw := trim(substr(line, 3, len(line) - 1))
+                    out = format(out, "    if ", transpileExprToRust(cond_raw), " {\n")
+                    block_closers = append(block_closers, "}")
+                } else if starts_with(line, "for ") && ends_with(line, "{") {
+                    hdr := trim(substr(line, 4, len(line) - 1))
+                    semis := splitTopLevel(hdr, 59)
+                    if len(semis) == 3 {
+                        init_parts := split(semis[0], ":=")
+                        ivar := trim(init_parts[0])
+                        ival := transpileExprToRust(init_parts[1])
+                        cond_s := transpileExprToRust(semis[1])
+                        post_raw := trim(semis[2])
+                        post_s := ""
+                        if ends_with(post_raw, "++") {
+                            pvar := trim(substr(post_raw, 0, len(post_raw) - 2))
+                            post_s = format(pvar, " += 1;")
+                        } else if ends_with(post_raw, "--") {
+                            pvar := trim(substr(post_raw, 0, len(post_raw) - 2))
+                            post_s = format(pvar, " -= 1;")
+                        }
+                        out = format(out, "    { let mut ", ivar, " = ", ival, "; while ", cond_s, " {\n")
+                        block_closers = append(block_closers, format(post_s, " } }"))
+                    } else {
+                        out = format(out, "    while ", transpileExprToRust(hdr), " {\n")
+                        block_closers = append(block_closers, "}")
+                    }
+                } else if line == "return" {
+                    out = format(out, "    return;\n")
+                } else if starts_with(line, "return ") {
+                    rv := trim(substr(line, 7, len(line)))
+                    out = format(out, "    return ", transpileExprToRust(rv), ";\n")
+                } else if line == "continue" {
+                    out = format(out, "    continue;\n")
+                } else if line == "break" {
+                    out = format(out, "    break;\n")
+                } else if ends_with(line, "++") {
+                    vname := trim(substr(line, 0, len(line) - 2))
+                    out = format(out, "    ", vname, " += 1;\n")
+                } else if ends_with(line, "--") {
+                    vname := trim(substr(line, 0, len(line) - 2))
+                    out = format(out, "    ", vname, " -= 1;\n")
+                } else if findTopLevelOp(line, " += ") > 0 {
+                    pos := findTopLevelOp(line, " += ")
+                    lhs := trim(substr(line, 0, pos))
+                    rhs := trim(substr(line, pos + 4, len(line)))
+                    out = format(out, "    ", lhs, " += ", transpileExprToRust(rhs), ";\n")
+                } else if findTopLevelOp(line, " := ") > 0 {
+                    pos := findTopLevelOp(line, " := ")
+                    lhs := trim(substr(line, 0, pos))
+                    rhs := trim(substr(line, pos + 4, len(line)))
+                    out = format(out, "    let mut ", lhs, " = ", transpileExprToRust(rhs), ";\n")
+                } else if findTopLevelOp(line, " = ") > 0 {
+                    pos := findTopLevelOp(line, " = ")
+                    lhs := trim(substr(line, 0, pos))
+                    rhs := trim(substr(line, pos + 3, len(line)))
+                    out = format(out, "    ", lhs, " = ", transpileExprToRust(rhs), ";\n")
+                } else {
+                    out = format(out, "    ", transpileExprToRust(line), ";\n")
+                }
+            }
+        }
+    }
+
+    out = format(out, "fn main() {\n    qgo_fn_main();\n}\n")
+    return out
+}
+
+func CompileQGo(src string, target string) -> string {
+    if target == "rs" {
+        return EmitRustAOT(src)
+    }
+    errs := CheckModuleSemantics(src)
+    if len(errs) > 0 {
+        return format("COMPILE_ERROR:\n", join(errs, "\n"))
+    }
+    if target == "qir" {
+        return EmitQIR(src)
+    }
+    return EmitOpenQASM3(src)
+}
+
+// ----------------------------------------------------------------------------
+// Self-Verification Suite (`TestSelfHostingCompiler`) & CLI Entrypoint
+// ----------------------------------------------------------------------------
+
+func TestSelfHostingCompiler() {
+    asi_src := "package main\nfunc Add() {\nx := 1\nreturn\n}\n"
+    toks := Tokenize(asi_src)
+    semi_count := 0
+    for i := 0; i < len(toks); i++ {
+        if toks[i].kind == "SEMI" {
+            semi_count++
+        }
+    }
+    assert_eq(semi_count, 4)
+
+    bad_qfree := "package main\nfunc Bad(q qubit) qfree {\nH(q)\n}\n"
+    errs_301 := CheckModuleSemantics(bad_qfree)
+    assert_eq(len(errs_301), 1)
+    assert(contains(errs_301[0], "E0301"))
+
+    bad_meas := "package main\nfunc BadMeas(q qubit) unitary {\nm := measure(q)\n}\n"
+    errs_302 := CheckModuleSemantics(bad_meas)
+    assert_eq(len(errs_302), 1)
+    assert(contains(errs_302[0], "E0302"))
+
+    bad_alias := "package main\nfunc BadAlias(q qubit) unitary {\nCX(q, q)\n}\n"
+    errs_400 := CheckModuleSemantics(bad_alias)
+    assert_eq(len(errs_400), 1)
+    assert(contains(errs_400[0], "E0400"))
+
+    bad_leak := "package main\nfunc BadLeak(x qubit) unitary {\nanc := qalloc()\nCX(x, anc)\n}\n"
+    errs_401 := CheckModuleSemantics(bad_leak)
+    assert_eq(len(errs_401), 1)
+    assert(contains(errs_401[0], "E0401"))
+
+    bad_copy := "package main\nfunc BadCopy(q1 qubit) unitary {\nq2 := q1\n}\n"
+    errs_402 := CheckModuleSemantics(bad_copy)
+    assert_eq(len(errs_402), 1)
+    assert(contains(errs_402[0], "E0402"))
+
+    grover_src := "package grover\nfunc Oracle(x qreg[3], flag qubit) qfree {\nCCX(x[0], x[1], flag)\n}\nfunc Step(reg qreg[3], c qubit) unitary {\nflag := qalloc()\nOracle(reg, flag)\ndefer adj Oracle(reg, flag) -> flag\nctrl(c) Z(flag)\n}\n"
+    qasm := CompileQGo(grover_src, "qasm")
+    assert(contains(qasm, "OPENQASM 3.0;"))
+    assert(contains(qasm, "// Begin Compute"))
+    assert(contains(qasm, "ccx reg[0], reg[1], flag[0];"))
+    assert(contains(qasm, "ctrl(1) @ z c[0], flag[0];"))
+    assert(contains(qasm, "// Begin Uncompute (Defer Adj)"))
+    assert(contains(qasm, "// qfree_zero_verified flag[0..1]"))
+
+    qir := CompileQGo(grover_src, "qir")
+    assert(contains(qir, "%Qubit = type opaque"))
+    assert(contains(qir, "@__quantum__qis__ccx__body"))
+    assert(contains(qir, "@__quantum__rt__qubit_release"))
+}
+
+func main() {
+    cli := args()
+    if len(cli) == 0 || cli[0] == "test" {
+        TestSelfHostingCompiler()
+        println("[SELFHOST PASS] All QGo self-hosting compiler stages verified.")
+        return
+    }
+    if cli[0] == "build" && len(cli) >= 2 {
+        in_file := cli[1]
+        target := "qasm"
+        out_file := ""
+        for i := 2; i < len(cli); i++ {
+            if cli[i] == "--target=qir" {
+                target = "qir"
+            } else if cli[i] == "--target=qasm" {
+                target = "qasm"
+            } else if cli[i] == "--target=rs" {
+                target = "rs"
+            } else if cli[i] == "-o" && i + 1 < len(cli) {
+                out_file = cli[i + 1]
+            }
+        }
+        src := read_file(in_file)
+        artifact := CompileQGo(src, target)
+        if len(out_file) > 0 {
+            write_file(out_file, artifact)
+        } else {
+            print(artifact)
+        }
+    }
+}

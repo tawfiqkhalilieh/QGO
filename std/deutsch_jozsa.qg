@@ -1,0 +1,48 @@
+package deutsch_jozsa
+
+// Constant-1 reversible oracle: f(x) = 1 for all x in {0,1}^3.
+func ConstantOneOracle(x qreg[3], anc qubit) qfree {
+    X(anc)
+}
+
+// Balanced parity oracle: f(x) = x_0 ^ x_1 ^ x_2.
+func BalancedParityOracle(x qreg[3], anc qubit) qfree {
+    CX(x[0], anc)
+    CX(x[1], anc)
+    CX(x[2], anc)
+}
+
+// Deutsch-Jozsa circuit for the constant oracle using `defer adj` ancilla uncomputation.
+// Leaves `x` in |000> with probability 1.0.
+func DeutschJozsaConstant(x qreg[3]) unitary {
+    H(x[:])
+    anc := qalloc()
+    ConstantOneOracle(x, anc)
+    defer adj ConstantOneOracle(x, anc) -> anc
+    Z(anc)
+    H(x[:])
+}
+
+// Deutsch-Jozsa circuit for the balanced oracle using `defer adj` ancilla uncomputation.
+// Leaves `x` orthogonal to |000> (specifically |111> = |7>) with probability 1.0.
+func DeutschJozsaBalanced(x qreg[3]) unitary {
+    H(x[:])
+    anc := qalloc()
+    BalancedParityOracle(x, anc)
+    defer adj BalancedParityOracle(x, anc) -> anc
+    Z(anc)
+    H(x[:])
+}
+
+func TestDeutschJozsa() {
+    c_reg := qalloc[3]()
+    DeutschJozsaConstant(c_reg)
+    assert(prob_basis(c_reg, 0) > 0.999999999)
+    assert_eq(peek_uint(c_reg), 0)
+
+    b_reg := qalloc[3]()
+    DeutschJozsaBalanced(b_reg)
+    assert(prob_basis(b_reg, 0) < 0.000000001)
+    assert(prob_basis(b_reg, 7) > 0.999999999)
+    assert_eq(peek_uint(b_reg), 7)
+}

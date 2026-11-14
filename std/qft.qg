@@ -1,0 +1,58 @@
+package qft
+
+// In-place 3-qubit Quantum Fourier Transform (QFT) in little-endian basis (reg[0] = LSB).
+func QFT3(reg qreg[3]) unitary {
+    H(reg[2])
+    CP(1.5707963267948966, reg[1], reg[2])
+    CP(0.7853981633974483, reg[0], reg[2])
+
+    H(reg[1])
+    CP(1.5707963267948966, reg[0], reg[1])
+
+    H(reg[0])
+
+    Swap(reg[0], reg[2])
+}
+
+// In-place 4-qubit Quantum Fourier Transform (QFT).
+// Supports automatic `adj QFT4(reg)` inverse and `ctrl(c) QFT4(reg)` controlled execution.
+func QFT4(reg qreg[4]) unitary {
+    H(reg[0])
+    CP(1.5707963267948966, reg[1], reg[0])
+    CP(0.7853981633974483, reg[2], reg[0])
+    CP(0.39269908169872414, reg[3], reg[0])
+
+    H(reg[1])
+    CP(1.5707963267948966, reg[2], reg[1])
+    CP(0.7853981633974483, reg[3], reg[1])
+
+    H(reg[2])
+    CP(1.5707963267948966, reg[3], reg[2])
+
+    H(reg[3])
+
+    Swap(reg[0], reg[3])
+    Swap(reg[1], reg[2])
+}
+
+// Prepares basis state |5> = |0101> and maps it into the 4-qubit Fourier phase basis via QFT4.
+func QFT4Spectrum5(reg qreg[4]) unitary {
+    X(reg[0])
+    X(reg[2])
+    QFT4(reg)
+}
+
+// Verifies that QFT4 followed by its structural adjoint `adj QFT4` is the exact identity.
+func QFTRoundTrip5(reg qreg[4]) unitary {
+    X(reg[0])
+    X(reg[2])
+    QFT4(reg)
+    adj QFT4(reg)
+}
+
+func TestQFTRoundTrip() {
+    reg := qalloc[4]()
+    QFTRoundTrip5(reg)
+    assert(prob_basis(reg, 5) > 0.999999999)
+    assert_eq(peek_uint(reg), 5)
+}

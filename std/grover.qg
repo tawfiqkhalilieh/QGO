@@ -1,0 +1,53 @@
+package grover
+
+// Reversible boolean oracle marking the all-ones state |1111>.
+func AllOnesOracle(x qreg[4], flag qubit) qfree {
+    ctrl(x[0], x[1], x[2], x[3]) X(flag)
+}
+
+// Single 4-qubit Grover amplification iteration using `defer adj` automatic ancilla uncomputation.
+func GroverDiffusionStep(reg qreg[4]) unitary {
+    flag := qalloc()
+    AllOnesOracle(reg, flag)
+    defer adj AllOnesOracle(reg, flag) -> flag
+    Z(flag)
+
+    H(reg[:])
+    X(reg[:])
+    ctrl(reg[0], reg[1], reg[2]) Z(reg[3])
+    X(reg[:])
+    H(reg[:])
+}
+
+// 3-qubit oracle marking |111> = |7>.
+func Oracle3AllOnes(x qreg[3], flag qubit) qfree {
+    ctrl(x[0], x[1], x[2]) X(flag)
+}
+
+// Single 3-qubit Grover iteration with `defer adj` phase kickback.
+func GroverStep3(reg qreg[3]) unitary {
+    flag := qalloc()
+    Oracle3AllOnes(reg, flag)
+    defer adj Oracle3AllOnes(reg, flag) -> flag
+    Z(flag)
+
+    H(reg[:])
+    X(reg[:])
+    ctrl(reg[0], reg[1]) Z(reg[2])
+    X(reg[:])
+    H(reg[:])
+}
+
+// Full 2-iteration 3-qubit Grover search amplifying |111> to P = 121/128 (~94.53%).
+func GroverSearch3Qubit(reg qreg[3]) unitary {
+    H(reg[:])
+    GroverStep3(reg)
+    GroverStep3(reg)
+}
+
+func TestGroverSearch() {
+    reg := qalloc[3]()
+    GroverSearch3Qubit(reg)
+    assert(prob_basis(reg, 7) > 0.945)
+    assert_eq(peek_uint(reg), 7)
+}

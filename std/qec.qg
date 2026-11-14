@@ -1,0 +1,79 @@
+package qec
+
+// 3-Qubit Bit-Flip Code encoder: alpha|0> + beta|1> -> alpha|000> + beta|111>.
+func BitFlipEncode(code qreg[3]) qfree {
+    CX(code[0], code[1])
+    CX(code[0], code[2])
+}
+
+// Syndrome extraction for the 3-Qubit Bit-Flip Code:
+// syn[0] = code[0] ^ code[1], syn[1] = code[1] ^ code[2].
+func BitFlipSyndrome(code qreg[3], syn qreg[2]) qfree {
+    CX(code[0], syn[0])
+    CX(code[1], syn[0])
+    CX(code[1], syn[1])
+    CX(code[2], syn[1])
+}
+
+// Syndrome-based correction of any single-qubit X error on `code[0..3]`
+// followed by syndrome reset and decoding.
+func BitFlipCorrectAndDecode(code qreg[3]) {
+    syn := qalloc[2]()
+    BitFlipSyndrome(code, syn)
+
+    // Error on code[0]: syn == |01> (syn[0]=1, syn[1]=0)
+    X(syn[1])
+    CCX(syn[0], syn[1], code[0])
+    X(syn[1])
+
+    // Error on code[2]: syn == |10> (syn[0]=0, syn[1]=1)
+    X(syn[0])
+    CCX(syn[0], syn[1], code[2])
+    X(syn[0])
+
+    // Error on code[1]: syn == |11> (syn[0]=1, syn[1]=1)
+    CCX(syn[0], syn[1], code[1])
+
+    // Since `code` has now been restored to the error-free codespace,
+    // `syn` is uncomputed by flipping it back from the syndrome values, or we decode `code`:
+    adj BitFlipEncode(code)
+    reset(syn[0])
+    reset(syn[1])
+}
+
+// Pure coherent syndrome check on an error-free encoded codeword using `defer adj`.
+func VerifyErrorFreeCodeword(code qreg[3], check qubit) unitary {
+    BitFlipEncode(code)
+    syn := qalloc[2]()
+    BitFlipSyndrome(code, syn)
+    defer adj BitFlipSyndrome(code, syn) -> syn
+    // On a valid codeword, both syndrome bits are |0>, so X-flipped CCX sets `check` to |1>.
+    X(syn[:])
+    CCX(syn[0], syn[1], check)
+    X(syn[:])
+    adj BitFlipEncode(code)
+}
+
+func TestQuantumErrorCorrection() {
+    // 1. Verify coherent syndrome check with `defer adj` uncomputation
+    c0 := qalloc[3]()
+    X(c0[0])
+    ok_flag := qalloc()
+    VerifyErrorFreeCodeword(c0, ok_flag)
+    assert_eq(measure(ok_flag), 1)
+    assert_eq(peek_uint(c0), 1)
+
+    // 2. Inject single-qubit bit-flip X error on each physical qubit (0, 1, 2) and verify recovery
+    for err_idx := 0; err_idx < 3; err_idx++ {
+        code := qalloc[3]()
+        // Logical |1>
+        X(code[0])
+        BitFlipEncode(code)
+
+        // Inject single-qubit X error on physical qubit `err_idx`
+        X(code[err_idx])
+
+        BitFlipCorrectAndDecode(code)
+        assert_eq(measure(code[0]), 1)
+    }
+}

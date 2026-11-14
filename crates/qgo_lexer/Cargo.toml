@@ -1,0 +1,9 @@
+[package]
+name = "qgo_lexer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+qgo_span = { path = "../qgo_span" }

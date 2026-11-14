@@ -1,0 +1,44 @@
+package phase_est
+
+// In-place 3-qubit Quantum Fourier Transform in little-endian basis (reg[0] = LSB).
+func QFT3(reg qreg[3]) unitary {
+    H(reg[2])
+    CP(1.5707963267948966, reg[1], reg[2])
+    CP(0.7853981633974483, reg[0], reg[2])
+
+    H(reg[1])
+    CP(1.5707963267948966, reg[0], reg[1])
+
+    H(reg[0])
+
+    Swap(reg[0], reg[2])
+}
+
+// Quantum Phase Estimation (QPE) for unitary U = T (eigenphase theta = 1/8 on eigenstate |1>).
+// Applies controlled-U^(2^k) powers (`T`, `S`, `Z`) followed by inverse QFT (`adj QFT3`).
+func PhaseEstimationTGate(phase qreg[3], psi qubit) unitary {
+    // Prepare eigenstate |1> of T
+    X(psi)
+
+    // Prepare counting register in uniform superposition
+    H(phase[:])
+
+    // Controlled-U^(2^0) = ctrl-T on phase[0], Controlled-U^(2^1) = ctrl-S on phase[1],
+    // Controlled-U^(2^2) = ctrl-Z on phase[2].
+    ctrl(phase[0]) T(psi)
+    ctrl(phase[1]) S(psi)
+    ctrl(phase[2]) Z(psi)
+
+    // Inverse QFT via structural adjoint modifier
+    adj QFT3(phase)
+}
+
+func TestQuantumPhaseEstimation() {
+    phase := qalloc[3]()
+    psi := qalloc()
+    PhaseEstimationTGate(phase, psi)
+
+    // Eigenphase theta = 1/8 -> exact 3-bit integer y = 8 * (1/8) = 1 (0b001) with probability 1.0.
+    assert_eq(peek_uint(phase), 1)
+    assert(prob_basis(phase, 1) > 0.999999999)
+}

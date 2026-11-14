@@ -1,0 +1,66 @@
+package arith
+
+// Reversible Majority (MAJ) building block for Cuccaro ripple-carry addition.
+func MAJ(cin qubit, b qubit, a qubit) qfree {
+    CX(a, b)
+    CX(a, cin)
+    CCX(cin, b, a)
+}
+
+// Reversible UnMajority and Add (UMA) building block for Cuccaro ripple-carry addition.
+func UMA(cin qubit, b qubit, a qubit) qfree {
+    CCX(cin, b, a)
+    CX(a, cin)
+    CX(cin, b)
+}
+
+// 4-bit Reversible Cuccaro Ripple-Carry Adder (`b := (a + b) mod 16`).
+func Add4(a qint[4], b qint[4]) qfree {
+    CuccaroAdd(a, b)
+}
+
+// 4-bit Reversible Cuccaro Subtraction (`b := (b - a) mod 16`).
+func Sub4(a qint[4], b qint[4]) qfree {
+    CuccaroSub(a, b)
+}
+
+// 4-bit Draper QFT Adder (`b := (a + b) mod 16` in Fourier basis).
+func DraperAdd4(a qint[4], b qint[4]) unitary {
+    DraperAdd(a, b)
+}
+
+// Quantum conditional using `qfree` reversible arithmetic inequality (`x + y > 5`)
+// with automatic ancilla uncomputation.
+func ConditionalFlipIfSumGt5(x qint[4], y qint[4], target qubit) unitary {
+    if x + y > 5 {
+        X(target)
+    }
+}
+
+func TestReversibleArithmetic() {
+    a := qalloc[4]()
+    b := qalloc[4]()
+    // a = 3 (0b0011), b = 4 (0b0100)
+    X(a[0])
+    X(a[1])
+    X(b[2])
+
+    Add4(a, b)
+    assert_eq(peek_uint(a), 3)
+    assert_eq(peek_uint(b), 7)
+
+    Sub4(a, b)
+    assert_eq(peek_uint(a), 3)
+    assert_eq(peek_uint(b), 4)
+
+    DraperAdd4(a, b)
+    assert_eq(peek_uint(b), 7)
+    adj DraperAdd4(a, b)
+    assert_eq(peek_uint(b), 4)
+
+    target := qalloc()
+    ConditionalFlipIfSumGt5(a, b, target)
+    assert_eq(peek_uint(a), 3)
+    assert_eq(peek_uint(b), 4)
+    assert_eq(measure(target), 1)
+}

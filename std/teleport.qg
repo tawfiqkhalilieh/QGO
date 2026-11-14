@@ -1,0 +1,77 @@
+package teleport
+
+// Prepares a maximally entangled Bell state |\Phi^+> = (|00> + |11>) / sqrt(2).
+func BellPair(a qubit, b qubit) unitary {
+    H(a)
+    CX(a, b)
+}
+
+// Bell-basis decoding unitary (inverse of BellPair).
+func BellDecode(a qubit, b qubit) unitary {
+    adj BellPair(a, b)
+}
+
+// Hybrid Quantum Teleportation protocol with mid-circuit measurement and classical feed-forward.
+func TeleportBit(input_bit int) -> int {
+    msg := qalloc()
+    alice := qalloc()
+    bob := qalloc()
+
+    if input_bit == 1 {
+        X(msg)
+    }
+
+    // Create shared EPR pair between Alice and Bob
+    BellPair(alice, bob)
+
+    // Alice performs Bell-basis measurement on (msg, alice)
+    CX(msg, alice)
+    H(msg)
+
+    m0 := measure(msg)
+    m1 := measure(alice)
+
+    // Classical feed-forward corrections applied to Bob's qubit
+    if m1 == 1 {
+        X(bob)
+    }
+    if m0 == 1 {
+        Z(bob)
+    }
+
+    return measure(bob)
+}
+
+// Superdense Coding protocol transmitting 2 classical bits (b0, b1) using 1 entangled qubit.
+func SuperdenseTransmit(b0 int, b1 int) -> int {
+    alice := qalloc()
+    bob := qalloc()
+    BellPair(alice, bob)
+
+    // Alice encodes 2 classical bits onto her single qubit
+    if b1 == 1 {
+        X(alice)
+    }
+    if b0 == 1 {
+        Z(alice)
+    }
+
+    // Bob performs joint Bell-basis decoding
+    BellDecode(alice, bob)
+
+    d0 := measure(alice)
+    d1 := measure(bob)
+    return d0 + 2 * d1
+}
+
+func TestTeleportAndSuperdense() {
+    assert_eq(TeleportBit(0), 0)
+    assert_eq(TeleportBit(1), 1)
+
+    for code := 0; code < 4; code++ {
+        b0 := code & 1
+        b1 := (code >> 1) & 1
+        decoded := SuperdenseTransmit(b0, b1)
+        assert_eq(decoded, code)
+    }
+}

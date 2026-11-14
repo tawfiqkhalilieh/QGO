@@ -1,0 +1,59 @@
+package quantum_walk
+
+// Coined Discrete-Time Quantum Walk on an 8-node cycle (3-bit position register `pos` + 1-bit `coin`).
+// Demonstrates controlled reversible modular increment/decrement with `defer adj` carry uncomputation.
+
+// Computes the MSB carry `carry = pos[0] & pos[1]` into ancilla `carry`.
+func ComputeCarry2(pos qreg[3], carry qubit) qfree {
+    CCX(pos[0], pos[1], carry)
+}
+
+// Reversible modular increment (`pos := (pos + 1) mod 8`) using `defer adj` carry ancilla uncomputation.
+func IncrementCycle8(pos qreg[3]) unitary {
+    carry := qalloc()
+    ComputeCarry2(pos, carry)
+    defer adj ComputeCarry2(pos, carry) -> carry
+
+    CX(carry, pos[2])
+    CX(pos[0], pos[1])
+    X(pos[0])
+}
+
+// Reversible modular decrement (`pos := (pos - 1) mod 8`) via structural adjoint of IncrementCycle8.
+func DecrementCycle8(pos qreg[3]) unitary {
+    adj IncrementCycle8(pos)
+}
+
+// Single step of a Coined Quantum Walk:
+// 1. Hadamard coin toss `H(coin)`
+// 2. If `coin == 1`, increment position (`ctrl(coin) IncrementCycle8(pos)`)
+// 3. If `coin == 0`, decrement position (`X(coin); ctrl(coin) DecrementCycle8(pos); X(coin)`)
+func QuantumWalkStep(coin qubit, pos qreg[3]) unitary {
+    H(coin)
+    ctrl(coin) IncrementCycle8(pos)
+    X(coin)
+    ctrl(coin) DecrementCycle8(pos)
+    X(coin)
+}
+
+// 3-step Coined Quantum Walk on an 8-cycle starting at |coin=0, pos=4>.
+func QuantumWalk3Steps(coin qubit, pos qreg[3]) unitary {
+    // Start walker at node 4 (0b100)
+    X(pos[2])
+
+    QuantumWalkStep(coin, pos)
+    QuantumWalkStep(coin, pos)
+    QuantumWalkStep(coin, pos)
+}
+
+func TestQuantumWalk() {
+    coin := qalloc()
+    pos := qalloc[3]()
+    QuantumWalk3Steps(coin, pos)
+
+    // After 3 steps from even node 4 (parity 0), walker must reside exclusively on odd nodes {1, 3, 5, 7}.
+    p_odd := prob_basis(pos, 1) + prob_basis(pos, 3) + prob_basis(pos, 5) + prob_basis(pos, 7)
+    p_even := prob_basis(pos, 0) + prob_basis(pos, 2) + prob_basis(pos, 4) + prob_basis(pos, 6)
+    assert(p_odd > 0.999999999)
+    assert(p_even < 0.000000001)
+}

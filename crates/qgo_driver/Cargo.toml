@@ -1,0 +1,22 @@
+[package]
+name = "qgo_driver"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "qgo"
+path = "src/main.rs"
+
+[dependencies]
+qgo_span = { path = "../qgo_span" }
+qgo_lexer = { path = "../qgo_lexer" }
+qgo_syntax = { path = "../qgo_syntax" }
+qgo_hir = { path = "../qgo_hir" }
+qgo_mir = { path = "../qgo_mir" }
+qgo_opt = { path = "../qgo_opt" }
+qgo_codegen_qasm = { path = "../qgo_codegen_qasm" }
+qgo_codegen_qir = { path = "../qgo_codegen_qir" }
+qgo_sim = { path = "../qgo_sim" }
+qgo_lsp = { path = "../qgo_lsp" }

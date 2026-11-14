@@ -1,0 +1,26 @@
+package bernstein_vazirani
+
+// Hidden linear function f_s(x) = (s . x) mod 2 for secret s = 13 (0b1101 = bits 0, 2, 3).
+func Secret13Oracle(x qreg[4], anc qubit) qfree {
+    CX(x[0], anc)
+    CX(x[2], anc)
+    CX(x[3], anc)
+}
+
+// Bernstein-Vazirani algorithm recovering the 4-bit secret string in a single oracle query
+// with automatic `defer adj` ancilla uncomputation.
+func BernsteinVazirani13(x qreg[4]) unitary {
+    H(x[:])
+    anc := qalloc()
+    Secret13Oracle(x, anc)
+    defer adj Secret13Oracle(x, anc) -> anc
+    Z(anc)
+    H(x[:])
+}
+
+func TestBernsteinVazirani() {
+    x := qalloc[4]()
+    BernsteinVazirani13(x)
+    assert(prob_basis(x, 13) > 0.999999999)
+    assert_eq(peek_uint(x), 13)
+}
